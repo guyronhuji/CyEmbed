@@ -68,6 +68,19 @@ def gaussian_kl_standard_normal(mu: Tensor, logvar: Tensor) -> Tensor:
     return -0.5 * (1.0 + logvar - mu.pow(2) - logvar.exp()).sum(dim=1)
 
 
+def apply_sample_offset(x_hat: Tensor, B: Tensor | None, sample_idx: Tensor | None) -> Tensor:
+    """Add the centred per-patient offset B_eff[sample_idx] to x_hat.
+
+    B is centred across patients (zero-sum) so the global baseline stays in b/A and B carries
+    only per-patient deviation. Returns x_hat unchanged when the offset is disabled (B is None)
+    or when no sample index is supplied (e.g. generating at the average patient baseline).
+    """
+    if B is None or sample_idx is None:
+        return x_hat
+    B_eff = B - B.mean(0, keepdim=True)
+    return x_hat + B_eff[sample_idx]
+
+
 class ArchetypeEmbeddingModel(nn.Module):
     """Archetype model with simplex cell weights and configurable decoder."""
 
@@ -82,6 +95,8 @@ class ArchetypeEmbeddingModel(nn.Module):
         entmax_alpha: float = 1.5,
         decoder_type: str = "factorized",
         dropout: float = 0.0,
+        n_samples: int | None = None,
+        use_sample_offset: bool = False,
     ) -> None:
         super().__init__()
         if decoder_type not in {"factorized", "direct"}:
@@ -100,6 +115,7 @@ class ArchetypeEmbeddingModel(nn.Module):
         self.tau = float(tau)
         self.logit_normalizer = str(logit_normalizer).lower()
         self.entmax_alpha = float(entmax_alpha)
+        self.use_sample_offset = bool(use_sample_offset)
 
         self.encoder = EncoderMLP(
             input_dim=num_markers,
@@ -119,6 +135,16 @@ class ArchetypeEmbeddingModel(nn.Module):
             self.E = None
             self.b = None
 
+        # Per-patient additive decoder intercept: B[s] is added to x_hat for cells of
+        # sample s, so archetypes model deviation from each patient's own baseline. For the
+        # direct decoder (self.b is None) this becomes the decoder's only intercept.
+        if self.use_sample_offset:
+            if n_samples is None or int(n_samples) <= 0:
+                raise ValueError("n_samples must be a positive int when use_sample_offset=True.")
+            self.B = nn.Parameter(torch.zeros(int(n_samples), num_markers))
+        else:
+            self.B = None
+
     def _simplex_weights(self, logits: Tensor, tau_override: float | None = None) -> Tensor:
         tau = float(tau_override if tau_override is not None else self.tau)
         return simplex_weights_from_logits(
@@ -128,7 +154,9 @@ class ArchetypeEmbeddingModel(nn.Module):
             entmax_alpha=self.entmax_alpha,
         )
 
-    def decode_from_weights(self, w: Tensor) -> tuple[Tensor | None, Tensor, Tensor]:
+    def decode_from_weights(
+        self, w: Tensor, sample_idx: Tensor | None = None
+    ) -> tuple[Tensor | None, Tensor, Tensor]:
         if self.decoder_type == "factorized":
             h = w @ self.Z
             x_hat = h @ self.E.T + self.b
@@ -137,12 +165,19 @@ class ArchetypeEmbeddingModel(nn.Module):
             h = None
             x_hat = w @ self.A
             a_hat = self.A
+        # a_hat stays batch-independent (archetype profile at the average patient baseline).
+        x_hat = apply_sample_offset(x_hat, self.B, sample_idx)
         return h, x_hat, a_hat
 
-    def forward(self, x: Tensor, tau_override: float | None = None) -> dict[str, Tensor | None]:
+    def forward(
+        self,
+        x: Tensor,
+        tau_override: float | None = None,
+        sample_idx: Tensor | None = None,
+    ) -> dict[str, Tensor | None]:
         u = self.encoder(x)
         w = self._simplex_weights(u, tau_override=tau_override)
-        h, x_hat, a_hat = self.decode_from_weights(w)
+        h, x_hat, a_hat = self.decode_from_weights(w, sample_idx=sample_idx)
         return {
             "U": u,
             "W": w,
@@ -176,6 +211,8 @@ class ProbabilisticArchetypeModel(nn.Module):
         logvar_min: float = -10.0,
         logvar_max: float = 10.0,
         logvar_init_bias: float = -3.0,
+        n_samples: int | None = None,
+        use_sample_offset: bool = False,
     ) -> None:
         super().__init__()
         if decoder_type not in {"factorized", "direct"}:
@@ -198,6 +235,7 @@ class ProbabilisticArchetypeModel(nn.Module):
         self.residual_dim = int(residual_dim)
         self.logvar_min = float(logvar_min)
         self.logvar_max = float(logvar_max)
+        self.use_sample_offset = bool(use_sample_offset)
 
         trunk_dims = [num_markers, *hidden_dims]
         trunk_layers: list[nn.Module] = []
@@ -242,6 +280,15 @@ class ProbabilisticArchetypeModel(nn.Module):
             else:
                 self.G = None
 
+        # Per-patient additive decoder intercept (see ArchetypeEmbeddingModel for rationale).
+        # For the direct decoder (self.b is None) this becomes the decoder's only intercept.
+        if self.use_sample_offset:
+            if n_samples is None or int(n_samples) <= 0:
+                raise ValueError("n_samples must be a positive int when use_sample_offset=True.")
+            self.B = nn.Parameter(torch.zeros(int(n_samples), num_markers))
+        else:
+            self.B = None
+
     def _simplex_weights(self, logits: Tensor, tau_override: float | None = None) -> Tensor:
         tau = float(tau_override if tau_override is not None else self.tau)
         return simplex_weights_from_logits(
@@ -275,6 +322,7 @@ class ProbabilisticArchetypeModel(nn.Module):
         self,
         w: Tensor,
         r: Tensor | None = None,
+        sample_idx: Tensor | None = None,
     ) -> tuple[Tensor | None, Tensor | None, Tensor, Tensor]:
         if self.decoder_type == "factorized":
             h_main = w @ self.Z
@@ -284,6 +332,8 @@ class ProbabilisticArchetypeModel(nn.Module):
                 h_total = h_main + r_proj
             x_hat = h_total @ self.E.T + self.b
             a_hat = self.Z @ self.E.T + self.b
+            # a_hat stays batch-independent; only x_hat gets the per-patient offset.
+            x_hat = apply_sample_offset(x_hat, self.B, sample_idx)
             return h_main, h_total, x_hat, a_hat
 
         x_hat_main = w @ self.A
@@ -291,6 +341,7 @@ class ProbabilisticArchetypeModel(nn.Module):
             x_hat = x_hat_main + (r @ self.G)
         else:
             x_hat = x_hat_main
+        x_hat = apply_sample_offset(x_hat, self.B, sample_idx)
         return None, None, x_hat, self.A
 
     def forward(
@@ -299,6 +350,7 @@ class ProbabilisticArchetypeModel(nn.Module):
         tau_override: float | None = None,
         sample: bool = True,
         use_posterior_mean: bool = False,
+        sample_idx: Tensor | None = None,
     ) -> dict[str, Tensor | None]:
         mu_w, logvar_w, mu_r, logvar_r = self._encode(x)
 
@@ -316,7 +368,7 @@ class ProbabilisticArchetypeModel(nn.Module):
             else:
                 r_sample = reparameterize_gaussian(mu_r, logvar_r)
 
-        h_main, h_total, x_hat, a_hat = self._decode(w, r=r_sample)
+        h_main, h_total, x_hat, a_hat = self._decode(w, r=r_sample, sample_idx=sample_idx)
 
         kl_w = gaussian_kl_standard_normal(mu_w, logvar_w).mean()
         if self.use_residual_latent and mu_r is not None and logvar_r is not None:

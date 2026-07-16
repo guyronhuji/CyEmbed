@@ -168,9 +168,20 @@ def _load_saved_flat_summary(run_dir: Path) -> dict[str, Any] | None:
     return out
 
 
-def _batch_loader(x: np.ndarray, batch_size: int, shuffle: bool, num_workers: int = 0) -> DataLoader:
+def _batch_loader(
+    x: np.ndarray,
+    batch_size: int,
+    shuffle: bool,
+    num_workers: int = 0,
+    sample_idx: np.ndarray | None = None,
+) -> DataLoader:
     tensor = torch.from_numpy(np.asarray(x, dtype=np.float32))
-    ds = TensorDataset(tensor)
+    if sample_idx is None:
+        ds = TensorDataset(tensor)
+    else:
+        # sample_idx must ride inside the dataset so it stays aligned per cell under shuffle=True.
+        idx_tensor = torch.from_numpy(np.asarray(sample_idx, dtype=np.int64))
+        ds = TensorDataset(tensor, idx_tensor)
     return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, drop_last=False)
 
 
@@ -190,8 +201,11 @@ def _resolve_beta_value(base_beta: float, warmup_epochs: int, epoch: int) -> flo
     return float(base_beta) * frac
 
 
-def _build_model(num_markers: int, run_config: dict[str, Any]) -> nn.Module:
+def _build_model(
+    num_markers: int, run_config: dict[str, Any], n_samples: int | None = None
+) -> nn.Module:
     model_type = str(run_config["model_type"])
+    use_sample_offset = bool(run_config.get("use_sample_offset", False))
     if model_type == "probabilistic":
         return ProbabilisticArchetypeModel(
             num_markers=num_markers,
@@ -208,6 +222,8 @@ def _build_model(num_markers: int, run_config: dict[str, Any]) -> nn.Module:
             logvar_min=float(run_config.get("logvar_min", -10.0)),
             logvar_max=float(run_config.get("logvar_max", 10.0)),
             logvar_init_bias=float(run_config.get("logvar_init_bias", -3.0)),
+            n_samples=n_samples,
+            use_sample_offset=use_sample_offset,
         )
     return ArchetypeEmbeddingModel(
         num_markers=num_markers,
@@ -219,6 +235,8 @@ def _build_model(num_markers: int, run_config: dict[str, Any]) -> nn.Module:
         entmax_alpha=float(run_config.get("entmax_alpha", 1.5)),
         decoder_type=str(run_config["decoder_type"]),
         dropout=float(run_config.get("dropout", 0.0)),
+        n_samples=n_samples,
+        use_sample_offset=use_sample_offset,
     )
 
 
@@ -232,6 +250,7 @@ def _predict_batches(
     tau_override: float | None = None,
     prob_eval_mode: str = "mean",
     prob_eval_samples: int = 1,
+    sample_idx: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
     model.eval()
     blocks: dict[str, list[np.ndarray]] = {}
@@ -243,12 +262,15 @@ def _predict_batches(
         blocks.setdefault(key, []).append(tensor.detach().cpu().numpy())
 
     with torch.no_grad():
-        loader = _batch_loader(x, batch_size=batch_size, shuffle=False, num_workers=0)
-        for (batch,) in loader:
-            batch = batch.to(device)
+        loader = _batch_loader(
+            x, batch_size=batch_size, shuffle=False, num_workers=0, sample_idx=sample_idx
+        )
+        for batch_tuple in loader:
+            batch = batch_tuple[0].to(device)
+            idx = batch_tuple[1].to(device) if len(batch_tuple) > 1 else None
 
             if model_type == "deterministic":
-                out = model(batch, tau_override=tau_override)  # type: ignore[misc]
+                out = model(batch, tau_override=tau_override, sample_idx=idx)  # type: ignore[misc]
                 _append("X_hat", out["X_hat"])
                 _append("W", out["W"])
                 _append("U", out["U"])
@@ -258,7 +280,7 @@ def _predict_batches(
 
             mode = prob_eval_mode.lower()
             if mode == "mean":
-                out = model(batch, tau_override=tau_override, sample=False, use_posterior_mean=True)  # type: ignore[misc]
+                out = model(batch, tau_override=tau_override, sample=False, use_posterior_mean=True, sample_idx=idx)  # type: ignore[misc]
                 _append("X_hat", out["X_hat"])
                 _append("W", out["W"])
                 _append("W_mean", out["W_mean"])
@@ -268,7 +290,7 @@ def _predict_batches(
                 _append("mu_r", out.get("mu_r"))
                 _append("logvar_r", out.get("logvar_r"))
             elif mode == "sample":
-                out = model(batch, tau_override=tau_override, sample=True, use_posterior_mean=False)  # type: ignore[misc]
+                out = model(batch, tau_override=tau_override, sample=True, use_posterior_mean=False, sample_idx=idx)  # type: ignore[misc]
                 _append("X_hat", out["X_hat"])
                 _append("W", out["W"])
                 _append("W_mean", out["W_mean"])
@@ -285,7 +307,7 @@ def _predict_batches(
                 r_samples: list[torch.Tensor] = []
                 base_out = None
                 for _ in range(max(1, int(prob_eval_samples))):
-                    mc_out = model(batch, tau_override=tau_override, sample=True, use_posterior_mean=False)  # type: ignore[misc]
+                    mc_out = model(batch, tau_override=tau_override, sample=True, use_posterior_mean=False, sample_idx=idx)  # type: ignore[misc]
                     base_out = mc_out
                     x_hat_samples.append(mc_out["X_hat"])
                     w_samples.append(mc_out["W"])
@@ -310,7 +332,8 @@ def _predict_batches(
                 raise ValueError("prob_eval_mode must be one of {'mean', 'sample', 'mc'}.")
 
             if a_hat_cache is None:
-                out_for_a = model(batch[:1], tau_override=tau_override, sample=False, use_posterior_mean=True)  # type: ignore[misc]
+                idx_for_a = None if idx is None else idx[:1]
+                out_for_a = model(batch[:1], tau_override=tau_override, sample=False, use_posterior_mean=True, sample_idx=idx_for_a)  # type: ignore[misc]
                 if out_for_a.get("A_hat") is not None:
                     a_hat_cache = out_for_a["A_hat"].detach().cpu().numpy()
 
@@ -352,6 +375,7 @@ def _validation_recon_loss(
     tau_override: float | None = None,
     prob_eval_mode: str = "mean",
     prob_eval_samples: int = 1,
+    sample_idx: np.ndarray | None = None,
 ) -> float:
     val_eval = _predict_batches(
         model,
@@ -362,6 +386,7 @@ def _validation_recon_loss(
         tau_override=tau_override,
         prob_eval_mode=prob_eval_mode,
         prob_eval_samples=prob_eval_samples,
+        sample_idx=sample_idx,
     )
     return _reconstruction_loss_numpy(
         val_eval["X_hat"],
@@ -470,12 +495,45 @@ def train_one_run(
     else:
         print(device_msg)
 
-    model = _build_model(num_markers=x_full.shape[1], run_config=run_config).to(device)
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=float(run_config["lr"]),
-        weight_decay=float(run_config.get("weight_decay", 0.0)),
-    )
+    # Per-patient decoder offset: derive integer sample codes and slice them by the same
+    # train/val indices used for x_train/x_val (codes must ride the split, like x[train_idx]).
+    use_sample_offset = bool(run_config.get("use_sample_offset", False))
+    offset_levels: np.ndarray | None = None
+    codes_full: np.ndarray | None = None
+    codes_train: np.ndarray | None = None
+    codes_val: np.ndarray | None = None
+    n_samples: int | None = None
+    if use_sample_offset:
+        if sample_ids is None:
+            raise ValueError("use_sample_offset=True requires sample_ids.")
+        code_values, offset_levels = pd.factorize(np.asarray(sample_ids), sort=True)
+        codes_full = np.asarray(code_values, dtype=np.int64)
+        n_samples = int(len(offset_levels))
+        codes_train = codes_full if train_idx is None else codes_full[train_idx]
+        codes_val = codes_full if val_idx is None else codes_full[val_idx]
+        if codes_train.shape[0] != x_train.shape[0] or codes_val.shape[0] != x_val.shape[0]:
+            raise ValueError(
+                "Sample codes misaligned with data; pass train_idx/val_idx matching x_train/x_val."
+            )
+
+    model = _build_model(
+        num_markers=x_full.shape[1], run_config=run_config, n_samples=n_samples
+    ).to(device)
+    weight_decay = float(run_config.get("weight_decay", 0.0))
+    lr = float(run_config["lr"])
+    if getattr(model, "B", None) is not None:
+        # Keep B out of weight decay: shrinking patient offsets pushes patient effect back into
+        # the archetypes, silently defeating the feature.
+        decay_params = [p for n, p in model.named_parameters() if n != "B"]
+        optimizer = torch.optim.Adam(
+            [
+                {"params": decay_params, "weight_decay": weight_decay},
+                {"params": [model.B], "weight_decay": 0.0},
+            ],
+            lr=lr,
+        )
+    else:
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     epochs = int(run_config["epochs"])
     batch_size = int(run_config["batch_size"])
@@ -500,7 +558,9 @@ def train_one_run(
     beta_w = float(run_config.get("beta_w", 1e-3))
     beta_r = float(run_config.get("beta_r", 1e-3))
 
-    loader = _batch_loader(x_train, batch_size=batch_size, shuffle=True, num_workers=0)
+    loader = _batch_loader(
+        x_train, batch_size=batch_size, shuffle=True, num_workers=0, sample_idx=codes_train
+    )
     history_rows: list[dict[str, Any]] = []
     best_val_recon = float("inf")
     best_epoch = 0
@@ -525,10 +585,11 @@ def train_one_run(
         beta_w_eff = _resolve_beta_value(beta_w, kl_warmup_epochs, epoch)
         beta_r_eff = _resolve_beta_value(beta_r, kl_warmup_epochs, epoch)
 
-        for (batch,) in loader:
-            batch = batch.to(device)
+        for batch_tuple in loader:
+            batch = batch_tuple[0].to(device)
+            idx = batch_tuple[1].to(device) if len(batch_tuple) > 1 else None
             if model_type == "deterministic":
-                out = model(batch, tau_override=tau_override)  # type: ignore[misc]
+                out = model(batch, tau_override=tau_override, sample_idx=idx)  # type: ignore[misc]
                 archetype_matrix = model.archetype_separation_tensor()  # type: ignore[operator]
                 loss, parts = total_loss(
                     out["X_hat"],
@@ -545,7 +606,7 @@ def train_one_run(
                     rbf_gamma=rbf_gamma,
                 )
             else:
-                out = model(batch, tau_override=tau_override, sample=True, use_posterior_mean=False)  # type: ignore[misc]
+                out = model(batch, tau_override=tau_override, sample=True, use_posterior_mean=False, sample_idx=idx)  # type: ignore[misc]
                 archetype_matrix = model.archetype_separation_tensor()  # type: ignore[operator]
                 loss, parts = total_variational_loss(
                     out["X_hat"],
@@ -642,6 +703,7 @@ def train_one_run(
             tau_override=tau_override,
             prob_eval_mode=prob_eval_mode,
             prob_eval_samples=prob_eval_samples,
+            sample_idx=codes_val,
         )
         row = {"epoch": epoch, **epoch_means, "val_recon": val_recon}
         history_rows.append(row)
@@ -695,6 +757,7 @@ def train_one_run(
         tau_override=tau_override,
         prob_eval_mode=prob_eval_mode,
         prob_eval_samples=prob_eval_samples,
+        sample_idx=codes_full,
     )
     val_eval = _predict_batches(
         model,
@@ -705,6 +768,7 @@ def train_one_run(
         tau_override=tau_override,
         prob_eval_mode="mean" if model_type == "probabilistic" else prob_eval_mode,
         prob_eval_samples=prob_eval_samples,
+        sample_idx=codes_val,
     )
     train_eval = _predict_batches(
         model,
@@ -715,6 +779,7 @@ def train_one_run(
         tau_override=tau_override,
         prob_eval_mode="mean" if model_type == "probabilistic" else prob_eval_mode,
         prob_eval_samples=prob_eval_samples,
+        sample_idx=codes_train,
     )
     val_w_for_metrics = val_eval["W_mean"] if "W_mean" in val_eval else val_eval["W"]
     train_w_for_metrics = train_eval["W_mean"] if "W_mean" in train_eval else train_eval["W"]
@@ -753,6 +818,7 @@ def train_one_run(
             tau_override=tau_override,
             prob_eval_mode="sample",
             prob_eval_samples=1,
+            sample_idx=codes_full,
         )
         arrays["W_sample"] = sampled_eval["W"]
         arrays["U_sample"] = sampled_eval["U"]
@@ -772,6 +838,11 @@ def train_one_run(
         arrays["P_r"] = model.P_r.detach().cpu().numpy()  # type: ignore[attr-defined]
     if hasattr(model, "G") and getattr(model, "G") is not None:
         arrays["G"] = model.G.detach().cpu().numpy()  # type: ignore[attr-defined]
+    if hasattr(model, "B") and getattr(model, "B") is not None:
+        # Save the centred offset (what the decoder actually adds): zero-sum across patients and
+        # directly interpretable as per-patient deviation. The raw parameter lives in model_state.pt.
+        B_param = model.B.detach().cpu()  # type: ignore[attr-defined]
+        arrays["B"] = (B_param - B_param.mean(0, keepdim=True)).numpy()
 
     summary_metrics = {
         "run_id": run_id,
@@ -815,6 +886,13 @@ def train_one_run(
         scaler_state=scaler_state,
         model_state_dict=model.state_dict(),
     )
+
+    if offset_levels is not None:
+        # Row order of B.npy matches this level table (factorize with sort=True), so B rows
+        # stay interpretable as per-patient offsets.
+        pd.DataFrame(
+            {"sample_code": np.arange(len(offset_levels)), "sample_id": np.asarray(offset_levels)}
+        ).to_csv(run_dir / "sample_offset_levels.csv", index=False)
 
     flat_summary = {
         "run_id": run_id,

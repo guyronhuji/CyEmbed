@@ -135,6 +135,13 @@ def validate_run_config(config: dict[str, Any]) -> dict[str, Any]:
     cfg["entmax_alpha"] = entmax_alpha
     cfg["simplex_impl_version"] = 3 if logit_normalizer == "entmax" else 1
 
+    # Inject use_sample_offset ONLY when enabled, and drop it otherwise, so that turning the
+    # feature off leaves the config fingerprint (and thus cached run directories) unchanged.
+    if bool(cfg.get("use_sample_offset", False)):
+        cfg["use_sample_offset"] = True
+    else:
+        cfg.pop("use_sample_offset", None)
+
     if model_type == "probabilistic":
         cfg["use_residual_latent"] = bool(cfg.get("use_residual_latent", False))
         cfg["residual_dim"] = int(cfg.get("residual_dim", cfg.get("d", 8)))
