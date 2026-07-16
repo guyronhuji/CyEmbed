@@ -363,6 +363,21 @@ direct decoder silently produces one run directory per value containing identica
 | 7 | 1.5070 | 1.0 | **1.000** | 0.029 |
 | 8 | 1.2261 | 2.7 | 0.679 | 0.430 |
 
+- **Archetype redundancy is the strongest criterion — lead with it.** `mean|off-diagonal|` of
+  `cosine_similarity_matrix(A_hat)`, measured against the same planted K_TRUE=5:
+
+  | K | 3 | 4 | **5** | 6 | 7 | 8 |
+  |---|---|---|---|---|---|---|
+  | mean\|cos\| | 0.209 | 0.324 | **0.078** | **1.000** | 0.993 | 0.985 |
+  | w_recovery | 0.492 | 0.500 | **0.991** | 0.020 | 0.022 | 0.029 |
+
+  Sharp minimum at the truth, then unmistakable: **1.000 means the archetypes have become
+  literally identical.** Above K_TRUE this model does not gracefully split archetypes, it
+  *collapses* — almost certainly `lambda_balance` forcing uniform usage across more archetypes
+  than the data supports. That also explains why cross-seed stability scores a perfect 1.000 at
+  K=7: every seed collapses to the *same* degenerate solution. Use `mean`, not `max` — max hits
+  1.000 at K=4 from one duplicate pair while mean is still 0.324.
+
 - **`val_recon` minimum works** — it is *not* monotone in K, because early stopping plus the
   `lambda_*` package makes excess archetypes cost you on held-out data. Check non-monotonicity on
   your own data before trusting it; if it falls all the way to your largest K, it is not selecting.

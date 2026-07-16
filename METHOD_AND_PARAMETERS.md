@@ -105,6 +105,13 @@ has.
 | 7 | 1.5070 | 1.0 | **1.000** | 0.029 |
 | 8 | 1.2261 | 2.7 | 0.679 | 0.430 |
 
+- **Archetype redundancy — the strongest criterion.** `mean|off-diag|` of
+  `cosine_similarity_matrix(A_hat)`: 0.209, 0.324, **0.078**, 1.000, 0.993, 0.985 for K=3..8.
+  Sharp minimum at truth, and **1.000 means archetypes have become identical**. Above K_TRUE this
+  model collapses rather than splitting (`lambda_balance` forcing uniform usage across more
+  archetypes than the data supports) — which is why stability scores a perfect 1.000 at K=7: every
+  seed reaches the *same* degenerate solution. Use `mean`, not `max` (max hits 1.000 at K=4 on one
+  duplicate pair).
 - **`val_recon` minimum** picks the truth. It is *not* monotone in K — early stopping plus the
   `lambda_*` package makes excess archetypes cost on held-out data. Verify non-monotonicity on
   your own data; if it falls to your largest K, it isn't selecting.
