@@ -149,7 +149,15 @@ def make_scrna(seed: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarra
     return z.astype(np.float32), sample_ids, shift, w_true, stats
 
 
-def base_config(model_type: str, decoder_type: str, use_offset: bool) -> dict:
+def base_config(model_type: str, decoder_type: str, use_offset: bool, variant: str = "plain") -> dict:
+    """variant="plain": softmax, no regularisers -- isolates the offset with fewest confounds.
+    variant="guide": the settings SCRNA_SEQ_GUIDE.md actually recommends and the real mcf7
+    notebook uses. Worth testing separately because lambda_sep penalises archetypes for being
+    SIMILAR, and identity archetypes are maximally separated -- so the separation penalty
+    plausibly rewards the very pathology the offset exists to remove. lambda_entropy and
+    lambda_balance should push the other way (both favour diffuse w, which is what routing the
+    shift through B produces), so the net effect is an empirical question, not an obvious one.
+    """
     cfg = {
         "model_type": model_type,
         "decoder_type": decoder_type,
@@ -171,28 +179,51 @@ def base_config(model_type: str, decoder_type: str, use_offset: bool) -> dict:
         "print_every": 100000,
         "deterministic": False,
     }
+    if variant == "guide":
+        cfg.update({
+            "logit_normalizer": "entmax",
+            "entmax_alpha": 1.5,
+            "lambda_entropy": 1e-3,
+            "lambda_sep": 1e-3,
+            "lambda_balance": 5e-2,
+            "separation_mode": "cosine_sq",
+            "balance_mode": "l2_uniform",
+        })
+    if model_type == "probabilistic":
+        cfg.update({
+            "use_residual_latent": False,   # per the guide: it absorbs dropout noise on sparse data
+            "beta_w": 1e-3,
+            "beta_r": 1e-3,
+            "kl_warmup_epochs": 10,
+            "prob_eval_mode": "mean",       # what the real mcf7 notebook uses
+            "prob_eval_samples": 3,
+        })
     if use_offset:
         cfg["use_sample_offset"] = True
     return cfg
 
 
-def run_case(decoder_type, use_offset, out_root, data, seed, model_type="deterministic") -> dict:
+def run_case(decoder_type, use_offset, out_root, data, seed, model_type="deterministic",
+             variant="plain") -> dict:
     z, sample_ids, shift, w_true, _ = data
     n = z.shape[0]
     train_idx, val_idx = split_train_val_indices(
         n, val_fraction=0.2, seed=0, stratify_labels=sample_ids
     )
-    run_id = f"{model_type}_{decoder_type}_{'on' if use_offset else 'off'}_s{seed}"
+    run_id = f"{model_type}_{decoder_type}_{variant}_{'on' if use_offset else 'off'}_s{seed}"
     res = train_one_run(
         x_train=z[train_idx], x_val=z[val_idx], x_full=z,
         marker_names=[f"g{i}" for i in range(z.shape[1])],
         cell_ids=[f"c{i}" for i in range(n)],
-        run_config=base_config(model_type, decoder_type, use_offset),
+        run_config=base_config(model_type, decoder_type, use_offset, variant),
         output_root=out_root, run_id=run_id, sample_ids=sample_ids,
         train_idx=train_idx, val_idx=val_idx,
     )
     run_dir = out_root / run_id
-    w = np.load(run_dir / "W.npy")
+    # For probabilistic runs prefer the posterior mean over a single sample -- it is what
+    # prob_eval_mode="mean" produces and what the real mcf7 analysis notebook reads.
+    w_mean_path = run_dir / "W_mean.npy"
+    w = np.load(w_mean_path if w_mean_path.exists() else run_dir / "W.npy")
     val_curve = res.history["val_recon"].to_numpy()
     out = {
         "spread": cross_patient_spread(w, sample_ids),
@@ -224,11 +255,23 @@ def main() -> None:
             f"{'wrec_off':>10}{'wrec_on':>9}{'modal_on':>9}"
             f"{'vrec_off':>10}{'vrec_on':>10}{'B~shift':>9}"
         )
-        for decoder_type in ("factorized", "direct"):
+        # (decoder, model_type, variant). Answers three questions in one matrix:
+        #   factorized vs direct        -- decoder choice at 2000 genes
+        #   plain vs guide              -- do the guide's regularisers (esp. lambda_sep) break it?
+        #   deterministic vs probabilistic -- what the KL/posterior buys, read via W_mean
+        CASES = [
+            ("factorized", "deterministic", "plain"),
+            ("direct", "deterministic", "plain"),
+            ("factorized", "deterministic", "guide"),
+            ("factorized", "probabilistic", "plain"),
+            ("factorized", "probabilistic", "guide"),
+        ]
+        first = True
+        for decoder_type, model_type, variant in CASES:
             offs, ons = [], []
             for seed in SEEDS:
                 data = make_scrna(seed)
-                if decoder_type == "factorized" and seed == SEEDS[0]:
+                if first and seed == SEEDS[0]:
                     s = data[4]
                     print(
                         f"\n[data realism] median gene detection {s['median_detection']:.1%} | "
@@ -238,11 +281,12 @@ def main() -> None:
                     )
                     print("\n" + header)
                     print("-" * len(header))
-                offs.append(run_case(decoder_type, False, out_root, data, seed))
-                ons.append(run_case(decoder_type, True, out_root, data, seed))
+                    first = False
+                offs.append(run_case(decoder_type, False, out_root, data, seed, model_type, variant))
+                ons.append(run_case(decoder_type, True, out_root, data, seed, model_type, variant))
 
             m = lambda rs, k: float(np.mean([r[k] for r in rs]))
-            tag = f"deterministic/{decoder_type}"
+            tag = f"{model_type[:4]}/{decoder_type}/{variant}"
             print(
                 f"{tag:<26}{m(offs,'spread'):>11.4f}{m(ons,'spread'):>11.4f}"
                 f"{m(offs,'w_rec'):>10.3f}{m(ons,'w_rec'):>9.3f}{m(ons,'modal'):>9.2f}"

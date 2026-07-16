@@ -300,6 +300,36 @@ instead of spending their capacity on biology. `factorized`'s `b` absorbs it for
 So on scRNA-seq you want `factorized` twice over: for the `E` gene-module readout, and because it
 measurably recovers more biology.
 
+### On `model_type`: probabilistic buys less than you'd think
+
+The recipe above sweeps `probabilistic`, but be deliberate about why. On the scRNA-seq-scale
+benchmark (`tools/verify_sample_offset_scrna.py`, 2000 HVGs, factorized decoder, measuring
+recovery of known composition):
+
+| | no regularisers | with this guide's regularisers |
+|---|---|---|
+| deterministic | 0.834 | **0.992** |
+| probabilistic | 0.978 | 0.856 |
+
+Read that as a 2×2, because the interaction is the whole story: **the KL and the explicit
+regularisers are substitutes, not complements.** Without `lambda_*`, the probabilistic model's KL
+does the regularising and helps a lot (0.834 → 0.978). With `lambda_*` already in place, adding
+the KL over-regularises and *costs* you accuracy (0.992 → 0.856). The best configuration here is
+**deterministic + the regularisers**.
+
+So the reason to choose `probabilistic` is not accuracy. It is the one thing the deterministic
+model cannot give you: a per-cell posterior (`mu_w`, `logvar_w`), so a shallow or ambiguous cell
+can report that its composition is uncertain instead of returning a confident point estimate. That
+is genuinely valuable on scRNA-seq, where depth varies enormously between cells.
+
+But note that `prob_eval_mode="mean"` — the default, and what the real mcf7 analysis notebook
+uses — takes the posterior mean and discards the uncertainty. If that is your workflow, you are
+paying seven extra hyperparameters (`beta_w`, `beta_r`, `kl_warmup_epochs`, `logvar_min/max`,
+`logvar_init_bias`, `prob_eval_*`) and some accuracy for something you then throw away. Use
+`probabilistic` when you will act on `logvar_w`; otherwise prefer `deterministic`.
+
+(Two seeds, one synthetic regime — evidence, not law. Sweep both on your own data.)
+
 ### On `recon_loss_type`
 
 `"huber"` is available and would genuinely help: Pearson residuals have heavy tails, and Huber
