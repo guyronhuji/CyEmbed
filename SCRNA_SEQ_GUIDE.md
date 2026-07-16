@@ -265,19 +265,34 @@ exactly what direct's `A` already spans. The parameter count runs the wrong way 
 Factorization only constrains anything — and only saves parameters — when `d < K`. At M=1000 and
 K=6 that means `d ≤ 4`. Above that it is a reparameterisation, not a bottleneck.
 
-**The real reason to prefer factorized here is `E` itself.** Each gene gets a d-dimensional
-coordinate, so genes that behave alike across archetypes sit near each other:
+**`E` is not a reason to prefer factorized.** It is tempting to read `E ∈ R^{M×d}` as a gene
+embedding you can mine for modules. Don't:
+
+- **It isn't identifiable.** For any invertible `R`, `Z@R` and `E@R⁻ᵀ` give an identical
+  reconstruction, so the optimiser lands on an arbitrary `R` and `cosine_similarity_matrix(E)`
+  is not invariant to it. Only `weight_decay` weakly prefers a balanced factorisation.
+- **Its useful content is K-dimensional, not d-dimensional.** `h = w @ Z` lives in `rowspace(Z)`,
+  at most K-dim; any part of `E` orthogonal to that contributes nothing to `x̂`.
+- **`A_hat` already gives you the gene groups, in both decoders.** Row `g` of `A_hat.T` is gene
+  `g`'s loading across archetypes — identifiable and directly interpretable.
+
+Measured on planted gene groups (200 marker genes per archetype, 2000 HVGs): recovering the true
+groups by cosine scores **AUC 1.000 from `E` and 1.000 from `A_hat.T`**, at every d ∈ {8,16,32}.
+`E` adds nothing. For gene modules, use:
 
 ```python
 from CyEmbed.analysis import cosine_similarity_matrix, nearest_neighbors_from_similarity
 
-gene_sim = cosine_similarity_matrix(run["E"])
+gene_sim = cosine_similarity_matrix(run["A_hat"].T)     # NOT run["E"]
 modules = nearest_neighbors_from_similarity(gene_sim, run["marker_names"], k=8)
 ```
 
-That is gene modules, free, as a by-product of fitting. At 40 CyTOF markers it is a curiosity; at
-1,000 genes it is a genuine readout, and the direct decoder gives you nothing comparable. This is
-why the recipe above sets `"factorized"` while the CyTOF notebooks use `"direct"`.
+**The reason to prefer factorized is empirical, and the mechanism is not established.** At 2000
+HVGs it recovers substantially more biology: w_recovery **0.818 vs 0.575** for direct (identical
+at 20 markers: 0.993 each). Both `A_hat`s are rank ≤ K, so it is not expressiveness. The likely
+cause is optimisation — the d-sweep shows a wider product parametrisation trains better at
+*identical rank* (0.712 at d=8 → 0.988 at d=16), and direct is single-factor and gets none of
+that. Treat the 0.818-vs-0.575 gap as the reason; treat any story about why as a hypothesis.
 
 One asymmetry to know: **the direct decoder has no bias term at all** (`self.b = None`,
 `model.py:120` and `:238`). At 40 CyTOF markers that costs little. At 2000 genes it costs a lot,
