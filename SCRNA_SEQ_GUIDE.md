@@ -280,10 +280,25 @@ That is gene modules, free, as a by-product of fitting. At 40 CyTOF markers it i
 why the recipe above sets `"factorized"` while the CyTOF notebooks use `"direct"`.
 
 One asymmetry to know: **the direct decoder has no bias term at all** (`self.b = None`,
-`model.py:120` and `:238`). Normally that matters — the intercept is what lets archetypes model
-deviation rather than absolute level. On Pearson residuals it mostly doesn't, since the data is
-already zero-centred per gene, so `b ≈ 0`. If you ever run on log1p data instead, the missing
-intercept becomes a real argument against `"direct"`.
+`model.py:120` and `:238`). At 40 CyTOF markers that costs little. At 2000 genes it costs a lot,
+and this turns out to be the second — and stronger — argument for `factorized`.
+
+`tools/verify_sample_offset_scrna.py` simulates the real thing (NB counts → analytic Pearson
+residuals → 2000 HVGs by residual variance, 6 patients, 26% median gene detection) and measures
+how well each decoder recovers known cell composition:
+
+| decoder | w_recovery @ 20 markers | w_recovery @ 2000 HVGs |
+|---|---|---|
+| factorized | 0.993 | **0.818** |
+| direct | 0.993 | **0.575** |
+
+Identical at CyTOF scale; a wide gap at scRNA scale. It is *not* expressiveness — both `A_hat`s
+are rank ≤ K. It is the intercept: with a per-patient `B` centred to zero-sum, `direct` has no
+per-gene intercept anywhere, so all K archetype rows must redundantly encode a 2000-gene baseline
+instead of spending their capacity on biology. `factorized`'s `b` absorbs it for free.
+
+So on scRNA-seq you want `factorized` twice over: for the `E` gene-module readout, and because it
+measurably recovers more biology.
 
 ### On `recon_loss_type`
 
