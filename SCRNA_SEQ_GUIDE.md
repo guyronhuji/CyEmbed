@@ -265,27 +265,39 @@ exactly what direct's `A` already spans. The parameter count runs the wrong way 
 Factorization only constrains anything — and only saves parameters — when `d < K`. At M=1000 and
 K=6 that means `d ≤ 4`. Above that it is a reparameterisation, not a bottleneck.
 
-**`E` is not a reason to prefer factorized.** It is tempting to read `E ∈ R^{M×d}` as a gene
-embedding you can mine for modules. Don't:
+**What `E` tells you, precisely.** Gene `g`'s archetype loading is `A_hat[:,g] = Z @ E_g + b_g`,
+so `E_g ≈ E_h` ⟹ the two genes load alike. Closeness in `E` is real information. Two caveats in
+theory: `E` is identifiable only up to an invertible `R` (`Z@R`, `E@R⁻ᵀ` reconstruct identically),
+and when `d > K` the `(d−K)`-dimensional `null(Z)` contributes nothing to `x̂`, so genes can differ
+there while being interchangeable to the model.
 
-- **It isn't identifiable.** For any invertible `R`, `Z@R` and `E@R⁻ᵀ` give an identical
-  reconstruction, so the optimiser lands on an arbitrary `R` and `cosine_similarity_matrix(E)`
-  is not invariant to it. Only `weight_decay` weakly prefers a balanced factorisation.
-- **Its useful content is K-dimensional, not d-dimensional.** `h = w @ Z` lives in `rowspace(Z)`,
-  at most K-dim; any part of `E` orthogonal to that contributes nothing to `x̂`.
-- **`A_hat` already gives you the gene groups, in both decoders.** Row `g` of `A_hat.T` is gene
-  `g`'s loading across archetypes — identifiable and directly interpretable.
+**Both caveats turn out to be inert.** Measured at 2000 HVGs against planted gene groups
+(200 markers per archetype):
 
-Measured on planted gene groups (200 marker genes per archetype, 2000 HVGs): recovering the true
-groups by cosine scores **AUC 1.000 from `E` and 1.000 from `A_hat.T`**, at every d ∈ {8,16,32}.
-`E` adds nothing. For gene modules, use:
+| readout | AUC on true gene groups | cross-seed agreement |
+|---|---|---|
+| `cosine_similarity_matrix(E)` | 1.000 | 0.764 |
+| `cosine_similarity_matrix(A_hat.T)` | 1.000 | 0.775 |
+
+Identical. Weight decay evidently pins the factorisation close enough to balanced that the
+residual transform is near-orthogonal and cosines are effectively invariant. **Use either.**
+
+`A_hat.T` is the marginally safer default — it is exactly the loadings, has no ambiguity even in
+principle, and exists for the direct decoder too:
 
 ```python
 from CyEmbed.analysis import cosine_similarity_matrix, nearest_neighbors_from_similarity
 
-gene_sim = cosine_similarity_matrix(run["A_hat"].T)     # NOT run["E"]
+gene_sim = cosine_similarity_matrix(run["A_hat"].T)     # or run["E"] -- measured equivalent
 modules = nearest_neighbors_from_similarity(gene_sim, run["marker_names"], k=8)
 ```
+
+**The real caveat is neither matrix: gene modules are only ~0.77 correlated across seeds.** That
+is the archetypes themselves moving between restarts, and no choice of readout fixes it. Treat any
+single-seed gene module as provisional; take a consensus across seeds before believing one.
+
+**What this does mean:** `E` gives you nothing `A_hat` doesn't, so it is **not** a reason to pick
+`factorized` over `direct`.
 
 **The reason to prefer factorized is empirical, and the mechanism is not established.** At 2000
 HVGs it recovers substantially more biology: w_recovery **0.818 vs 0.575** for direct (identical

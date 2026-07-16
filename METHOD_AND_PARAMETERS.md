@@ -151,11 +151,17 @@ not expressiveness (both `A_hat`s are rank ≤ K), and it is not simply "direct 
 carry a baseline. The likely cause is optimisation, consistent with §3.2 — a wider product
 parametrisation trains better at identical rank, and direct is single-factor.
 
-**`E` is *not* a reason to prefer factorized.** It is identifiable only up to an invertible `R`
-(`Z@R`, `E@R⁻ᵀ` reconstruct identically), its useful content is K-dimensional regardless of `d`,
-and `A_hat.T` gives the same gene groupings in **both** decoders. **[measured]** on planted gene
-groups: AUC **1.000 from `E`** and **1.000 from `A_hat.T`** at every d ∈ {8,16,32}. Use
-`cosine_similarity_matrix(A_hat.T)` for gene modules, not `E`.
+**`E` is *not* a reason to prefer factorized** — but it works fine. `E_g ≈ E_h` implies the genes
+load alike, so closeness in `E` is real information. In theory `E` is identifiable only up to an
+invertible `R`, and its `null(Z)` component is invisible to `x̂`; in practice neither bites.
+**[measured]** on planted gene groups at 2000 HVGs: AUC **1.000 from `E`** and **1.000 from
+`A_hat.T`**, with cross-seed agreement **0.764 vs 0.775** — equivalent. Weight decay pins the
+factorisation near-balanced, so cosines are effectively invariant. Use either; `A_hat.T` is
+marginally safer (exactly the loadings, no ambiguity, exists for `direct` too). The point is that
+`E` adds nothing *over* `A_hat`, not that it is unreliable.
+
+**[measured]** The real caveat is neither matrix: **gene modules are only ~0.77 correlated across
+seeds** — the archetypes move between restarts. Take a consensus before believing a module.
 
 ### 3.4 `model_type` — `"deterministic"` | `"probabilistic"`
 
