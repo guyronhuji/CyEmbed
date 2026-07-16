@@ -519,6 +519,31 @@ def train_one_run(
     model = _build_model(
         num_markers=x_full.shape[1], run_config=run_config, n_samples=n_samples
     ).to(device)
+
+    if getattr(model, "B", None) is not None and codes_train is not None:
+        # Warm-start B at its own optimum instead of racing for it.
+        #
+        # The reconstruction loss is degenerate between "the per-patient shift lives in B" and
+        # "it lives in identity archetypes" -- nothing in losses.py references sample_idx or any
+        # per-patient grouping of W, so both routes reconstruct equally well and whichever
+        # descends faster simply wins. That race is decoder-dependent: the factorized Z@E.T
+        # product parametrisation grows multiplicatively and outruns B's linear growth, baking the
+        # shift into archetypes where no loss term can pull it back out.
+        #
+        # Given w, B's optimum is the per-patient mean residual; at init the archetype route
+        # outputs ~0 and b is zeros, so that residual is just x. Starting there means the shift is
+        # already explained at step 0 and the archetypes never see patient structure to grab.
+        with torch.no_grad():
+            warm = np.zeros((int(n_samples), x_train.shape[1]), dtype=np.float32)
+            for code in range(int(n_samples)):
+                mask = codes_train == code
+                if mask.any():  # a patient absent from train keeps a zero offset
+                    warm[code] = x_train[mask].mean(axis=0)
+            # Centre across patients to match apply_sample_offset's zero-sum convention; the
+            # global level stays in b (factorized) or A (direct).
+            warm -= warm.mean(axis=0, keepdims=True)
+            model.B.copy_(torch.from_numpy(warm).to(device))  # type: ignore[attr-defined]
+
     weight_decay = float(run_config.get("weight_decay", 0.0))
     lr = float(run_config["lr"])
     if getattr(model, "B", None) is not None:

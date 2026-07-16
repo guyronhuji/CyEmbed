@@ -11,16 +11,22 @@ composition and checks the behaviour that motivated the feature:
     use_sample_offset=True  -> B absorbs the additive shift, so W is free to recover the shared
       composition and B recovers the planted shift up to centring.
 
-Decoder asymmetry (a real, expected result, not a bug):
-    * direct decoder  (x_hat = w @ A + B): the simplex constraint on w makes representing
-      arbitrary per-patient shifts through w expensive, so B is strongly preferred. Enabling it
-      collapses cross-patient spread to ~0 and unifies the dominant archetype. Decisive.
-    * factorized decoder (x_hat = h @ E.T + b + B): the low-rank latent path h = w @ Z can also
-      represent the shift, so the fix is genuinely *soft* -- B partially absorbs the shift but W
-      may still carry patient information. We assert the directional (not decisive) claim here.
+Both decoders are held to the same bar. An earlier version of this script gated the decisive
+assertions to decoder_type="direct" and justified it by claiming the simplex constraint on w makes
+per-patient shifts expensive to represent through w for direct but not for factorized. That
+rationale is false: h = w @ Z uses the same simplex w as w @ A, and both reachable sets are convex
+hulls of K points, so identity archetypes are equally available to both. The real asymmetry is in
+optimisation dynamics -- the factorized Z@E.T product parametrisation outruns B's linear growth --
+which is a thing to fix, not to encode as expected behaviour.
 
-Also asserts the regression guarantee: turning the offset off must not change the config
-fingerprint that keys cached run directories.
+Design notes, each earning its keep:
+  * off/on run on IDENTICAL data (seeded per case), so the comparison is paired.
+  * w_recovery is the load-bearing metric. Measuring only "patient structure absent from W" is
+    insufficient: a W that has collapsed to near-constant has no patient structure at all and
+    scores a perfect spread=0/modal=1 while having learned nothing. w_recovery separates the two.
+  * val_recon is reported. Adding a parameter that can always be zero must not make the fit worse;
+    if it does, that is a real signal.
+  * Multiple seeds, because spread is a std across patients and a single draw is not evidence.
 
 Run:  python tools/verify_sample_offset.py
 """
@@ -33,6 +39,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from scipy.optimize import linear_sum_assignment
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -41,33 +48,44 @@ from CyEmbed.data import split_train_val_indices
 from CyEmbed.train import _config_fingerprint, train_one_run
 from CyEmbed.utils import validate_run_config
 
-RNG = np.random.default_rng(0)
 K_TRUE = 3
 N_MARKERS = 20
-N_PER_PATIENT = 800
-N_PATIENTS = 3
-SHIFT_SCALE = 6.0
+N_PER_PATIENT = 300
+N_PATIENTS = 8
+# Signal-comparable, not signal-swamping: archetype rows are N(0, 3^2), so a shift of sd 2.0 is a
+# real confounder without making the dataset almost entirely patient offset.
+SHIFT_SCALE = 2.0
+SEEDS = (0, 1, 2)
 # Shared composition skewed toward archetype 0, so the true dominant archetype is the same for
 # every patient -- any per-patient difference in the recovered dominant archetype is leakage.
 ALPHA = np.array([6.0, 3.0, 3.0])
 PATIENT_NAMES = np.array([f"patient_{p}" for p in range(N_PATIENTS)])
 
 
-def make_synthetic() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def make_synthetic(seed: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Cells from K_TRUE archetypes with an IDENTICAL composition per patient, plus a known
-    constant per-patient shift. Returns (x, sample_ids, planted_shift[N_PATIENTS, M])."""
-    archetypes = RNG.normal(0.0, 1.0, size=(K_TRUE, N_MARKERS)) * 3.0
-    shift = RNG.normal(0.0, SHIFT_SCALE, size=(N_PATIENTS, N_MARKERS))
-    x_blocks, sample_blocks = [], []
+    constant per-patient shift.
+
+    Returns (x, sample_ids, planted_shift[N_PATIENTS, M], w_true[N, K_TRUE]).
+
+    Seeded per call so that the off/on arms of a case see the same dataset -- comparing spread
+    across two different random datasets, as an earlier version did, measures nothing.
+    """
+    rng = np.random.default_rng(seed)
+    archetypes = rng.normal(0.0, 1.0, size=(K_TRUE, N_MARKERS)) * 3.0
+    shift = rng.normal(0.0, SHIFT_SCALE, size=(N_PATIENTS, N_MARKERS))
+    x_blocks, sample_blocks, w_blocks = [], [], []
     for p in range(N_PATIENTS):
-        w = RNG.dirichlet(ALPHA, size=N_PER_PATIENT)
+        w = rng.dirichlet(ALPHA, size=N_PER_PATIENT)
         clean = w @ archetypes
-        noise = RNG.normal(0.0, 0.05, size=clean.shape)
+        noise = rng.normal(0.0, 0.05, size=clean.shape)
         x_blocks.append(clean + shift[p] + noise)
         sample_blocks.append(np.full(N_PER_PATIENT, PATIENT_NAMES[p]))
+        w_blocks.append(w)
     x = np.concatenate(x_blocks, axis=0).astype(np.float32)
     sample_ids = np.concatenate(sample_blocks, axis=0)
-    return x, sample_ids, shift
+    w_true = np.concatenate(w_blocks, axis=0)
+    return x, sample_ids, shift, w_true
 
 
 def _mean_weight_table(w: np.ndarray, sample_ids: np.ndarray) -> np.ndarray:
@@ -88,39 +106,50 @@ def modal_distinct(w: np.ndarray, sample_ids: np.ndarray) -> int:
     return len(set(modal.tolist()))
 
 
-def base_config(model_type: str, decoder_type: str, use_offset: bool) -> dict:
-    cfg = {
-        "model_type": model_type,
-        "decoder_type": decoder_type,
-        "K": K_TRUE,
-        "d": 8,
-        "hidden_dims": [64, 32],
-        "tau": 1.0,
-        "lr": 5e-3,
-        "epochs": 150,
-        "batch_size": 256,
-        "recon_loss_type": "mse",
-        "weight_decay": 1e-4,
-        "seed": 0,
-        "early_stopping": False,
-        "progress_epoch": False,
-        "print_every": 1000,
-        "deterministic": False,
-    }
-    if use_offset:
-        cfg["use_sample_offset"] = True
-    return cfg
+def _safe_corr(a: np.ndarray, b: np.ndarray) -> float:
+    """Pearson r, returning 0.0 for a degenerate (constant) input rather than nan.
+
+    The degenerate case is exactly the collapse we are hunting: a constant W column carries no
+    information, and 0.0 is the honest score for it.
+    """
+    if a.std() < 1e-12 or b.std() < 1e-12:
+        return 0.0
+    r = float(np.corrcoef(a, b)[0, 1])
+    return 0.0 if not np.isfinite(r) else r
 
 
-def run_case(model_type: str, decoder_type: str, use_offset: bool, out_root: Path) -> dict:
-    x, sample_ids, shift = make_synthetic()
+def w_recovery(w: np.ndarray, w_true: np.ndarray) -> float:
+    """Mean correlation between recovered and true archetype weights, after optimally matching
+    archetype identity (which is arbitrary up to permutation).
+
+    This is the check that distinguishes 'B absorbed the shift and W kept the biology' from
+    'W collapsed to a constant'. Both score spread~0; only the former scores high here.
+    """
+    k_rec, k_true = w.shape[1], w_true.shape[1]
+    corr = np.zeros((k_rec, k_true))
+    for i in range(k_rec):
+        for j in range(k_true):
+            corr[i, j] = _safe_corr(w[:, i], w_true[:, j])
+    rows, cols = linear_sum_assignment(-corr)
+    return float(corr[rows, cols].mean())
+
+
+def run_case(
+    model_type: str,
+    decoder_type: str,
+    use_offset: bool,
+    out_root: Path,
+    data: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+    seed: int,
+) -> dict:
+    x, sample_ids, shift, w_true = data
     n = x.shape[0]
     # Stratify within patient so every patient appears in both halves (required once B is on).
     train_idx, val_idx = split_train_val_indices(
         n, val_fraction=0.2, seed=0, stratify_labels=sample_ids
     )
-    run_id = f"{model_type}_{decoder_type}_{'on' if use_offset else 'off'}"
-    train_one_run(
+    run_id = f"{model_type}_{decoder_type}_{'on' if use_offset else 'off'}_s{seed}"
+    res = train_one_run(
         x_train=x[train_idx],
         x_val=x[val_idx],
         x_full=x,
@@ -135,9 +164,18 @@ def run_case(model_type: str, decoder_type: str, use_offset: bool, out_root: Pat
     )
     run_dir = out_root / run_id
     w = np.load(run_dir / "W.npy")
+
+    # train_one_run returns the full per-epoch history in memory, so persistence is unnecessary.
+    hist = res.history
+    val_curve = hist["val_recon"].to_numpy()
     result = {
         "spread": cross_patient_spread(w, sample_ids),
         "modal": modal_distinct(w, sample_ids),
+        "w_rec": w_recovery(w, w_true),
+        "val_recon": float(val_curve[-1]),
+        "val_best": float(val_curve.min()),
+        # Still descending at the end => the run was truncated, not converged.
+        "still_descending": bool(val_curve[-1] < val_curve[max(0, len(val_curve) - 20)] - 1e-4),
         "b_corr": None,
         "b_zero_sum": None,
     }
@@ -147,9 +185,47 @@ def run_case(model_type: str, decoder_type: str, use_offset: bool, out_root: Pat
         levels = pd.read_csv(run_dir / "sample_offset_levels.csv")["sample_id"].to_numpy()
         order = [int(np.where(PATIENT_NAMES == lv)[0][0]) for lv in levels]
         shift_centered = shift[order] - shift[order].mean(0, keepdims=True)
-        result["b_corr"] = float(np.corrcoef(B.ravel(), shift_centered.ravel())[0, 1])
+        result["b_corr"] = _safe_corr(B.ravel(), shift_centered.ravel())
         result["b_zero_sum"] = float(np.abs(B.mean(0)).max())
     return result
+
+
+def base_config(model_type: str, decoder_type: str, use_offset: bool) -> dict:
+    cfg = {
+        "model_type": model_type,
+        "decoder_type": decoder_type,
+        "K": K_TRUE,
+        "d": 8,
+        "hidden_dims": [64, 32],
+        "tau": 1.0,
+        "lr": 5e-3,
+        # Generous cap + early stopping, so every run is compared at convergence rather than at an
+        # arbitrary truncation point. At a fixed 150-300 epochs these runs are still descending,
+        # which made earlier val_recon comparisons meaningless.
+        "epochs": 3000,
+        "batch_size": 256,
+        "recon_loss_type": "mse",
+        "weight_decay": 1e-4,
+        "seed": 0,
+        # CPU, deliberately. These tensors are tiny (20 features, K=3, batch 256), so MPS
+        # kernel-launch overhead swamps the arithmetic: measured 2.0s on one CPU thread vs 23.3s
+        # on MPS for an identical 300-epoch run -- an 11.6x speedup by NOT using the GPU.
+        "device": "cpu",
+        "early_stopping": True,
+        "patience": 60,
+        "min_delta": 1e-5,
+        "progress_epoch": False,
+        "print_every": 100000,
+        "deterministic": False,
+    }
+    if use_offset:
+        cfg["use_sample_offset"] = True
+    return cfg
+
+
+def _agg(runs: list[dict], key: str) -> tuple[float, float]:
+    vals = np.array([r[key] for r in runs], dtype=float)
+    return float(vals.mean()), float(vals.std(ddof=0))
 
 
 def main() -> None:
@@ -173,40 +249,72 @@ def main() -> None:
     # --- Behavioural: planted-shift recovery across decoder/model types. ---
     with tempfile.TemporaryDirectory() as tmp:
         out_root = Path(tmp)
-        header = f"{'case':<26}{'spread_off':>11}{'spread_on':>11}{'modal_off':>11}{'modal_on':>10}{'B~shift':>9}{'B_zero':>9}"
-        print("\n" + header)
+        print(
+            f"\n{N_PATIENTS} patients x {N_PER_PATIENT} cells, {N_MARKERS} markers, "
+            f"shift sd={SHIFT_SCALE}, seeds={list(SEEDS)}\n"
+        )
+        header = (
+            f"{'case':<26}{'spread_off':>11}{'spread_on':>11}"
+            f"{'wrec_off':>10}{'wrec_on':>9}{'modal_on':>9}"
+            f"{'vrec_off':>10}{'vrec_on':>10}{'B~shift':>9}"
+        )
+        print(header)
+        print("-" * len(header))
         for model_type in ("deterministic", "probabilistic"):
             for decoder_type in ("factorized", "direct"):
-                off = run_case(model_type, decoder_type, False, out_root)
-                on = run_case(model_type, decoder_type, True, out_root)
+                offs, ons = [], []
+                for seed in SEEDS:
+                    data = make_synthetic(seed)  # SAME data for both arms
+                    offs.append(run_case(model_type, decoder_type, False, out_root, data, seed))
+                    ons.append(run_case(model_type, decoder_type, True, out_root, data, seed))
+
                 tag = f"{model_type}/{decoder_type}"
-                print(f"{tag:<26}{off['spread']:>11.4f}{on['spread']:>11.4f}"
-                      f"{off['modal']:>11d}{on['modal']:>10d}{on['b_corr']:>9.3f}{on['b_zero_sum']:>9.1e}")
+                spread_off, spread_off_sd = _agg(offs, "spread")
+                spread_on, spread_on_sd = _agg(ons, "spread")
+                wrec_off, _ = _agg(offs, "w_rec")
+                wrec_on, _ = _agg(ons, "w_rec")
+                modal_on, _ = _agg(ons, "modal")
+                vrec_off, _ = _agg(offs, "val_recon")
+                vrec_on, _ = _agg(ons, "val_recon")
+                bcorr, _ = _agg(ons, "b_corr")
 
-                # Invariants for both decoders.
-                if not (on["b_zero_sum"] < 1e-4):
-                    failures.append(f"{tag}: saved B not zero-sum (max|mean|={on['b_zero_sum']:.2e})")
-                if not (on["b_corr"] > 0.4):
-                    failures.append(f"{tag}: B does not positively recover shift (corr={on['b_corr']:.3f})")
-                if not (on["spread"] <= off["spread"] + 0.05):
-                    failures.append(f"{tag}: offset increased cross-patient spread "
-                                    f"({on['spread']:.4f} > {off['spread']:.4f})")
+                print(
+                    f"{tag:<26}{spread_off:>11.4f}{spread_on:>11.4f}"
+                    f"{wrec_off:>10.3f}{wrec_on:>9.3f}{modal_on:>9.2f}"
+                    f"{vrec_off:>10.3f}{vrec_on:>10.3f}{bcorr:>9.3f}"
+                )
 
-                # The direct decoder (simplex-constrained w) strongly prefers B for the shift.
-                if decoder_type == "direct" and not (on["b_corr"] > 0.9):
-                    failures.append(f"{tag}: direct B recovers shift poorly (corr={on['b_corr']:.3f})")
-
-                # Decisive claim -- cleanest, fully-identifiable config: deterministic + direct.
-                # Here B absorbing the shift collapses cross-patient spread to ~0 and unifies the
-                # dominant archetype. (Probabilistic sampling/KL and the factorized low-rank path
-                # both make the fix soft, so we don't demand a collapse there.)
-                if model_type == "deterministic" and decoder_type == "direct":
-                    if not (on["spread"] < 0.5 * off["spread"]):
-                        failures.append(f"{tag}: offset did not collapse spread "
-                                        f"({on['spread']:.4f} vs {off['spread']:.4f})")
-                    if not (on["modal"] <= off["modal"] and on["modal"] == 1):
-                        failures.append(f"{tag}: offset did not unify dominant archetype "
-                                        f"(modal off={off['modal']} on={on['modal']})")
+                # Same bar for every decoder. No gating.
+                if not (np.mean([r["b_zero_sum"] for r in ons]) < 1e-4):
+                    failures.append(f"{tag}: saved B not zero-sum")
+                if not (bcorr > 0.9):
+                    failures.append(f"{tag}: B recovers shift poorly (corr={bcorr:.3f})")
+                if not (spread_on < 0.5 * spread_off):
+                    failures.append(
+                        f"{tag}: offset did not collapse cross-patient spread "
+                        f"({spread_on:.4f} vs {spread_off:.4f})"
+                    )
+                if not (modal_on < 1.5):
+                    failures.append(
+                        f"{tag}: offset did not unify dominant archetype (modal={modal_on:.2f})"
+                    )
+                # The check that catches a collapsed W masquerading as a clean one.
+                if not (wrec_on > 0.7):
+                    failures.append(
+                        f"{tag}: W lost the biology with offset on (w_recovery={wrec_on:.3f}) "
+                        f"-- low spread here is collapse, not correction"
+                    )
+                # Adding a parameter that can always be zero must not hurt the fit.
+                if not (vrec_on <= vrec_off * 1.1 + 1e-3):
+                    failures.append(
+                        f"{tag}: offset made val_recon worse ({vrec_on:.3f} vs {vrec_off:.3f})"
+                    )
+                truncated = [r for r in ons if r["still_descending"]]
+                if truncated:
+                    print(
+                        f"  note: {len(truncated)}/{len(ons)} 'on' runs still descending at the "
+                        f"final epoch -- results may be truncation, not convergence"
+                    )
 
     print()
     if failures:
