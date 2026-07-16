@@ -124,6 +124,14 @@ def w_recovery(w: np.ndarray, w_true: np.ndarray) -> float:
 
     This is the check that distinguishes 'B absorbed the shift and W kept the biology' from
     'W collapsed to a constant'. Both score spread~0; only the former scores high here.
+
+    Normalised by max(k_rec, k_true), NOT by the number of matched pairs. linear_sum_assignment
+    returns only min(k_rec, k_true) pairs, so averaging over those scores a model on the
+    archetypes it happened to find and silently forgives the ones it missed -- at k_rec=3 vs
+    k_true=5 that let three good matches tie a complete recovery. Dividing by the larger dimension
+    charges for missed and spurious archetypes alike, which is what makes this usable to select K
+    rather than only to compare at fixed K. When k_rec == k_true the two are identical, so this
+    does not change any same-K result.
     """
     k_rec, k_true = w.shape[1], w_true.shape[1]
     corr = np.zeros((k_rec, k_true))
@@ -131,7 +139,7 @@ def w_recovery(w: np.ndarray, w_true: np.ndarray) -> float:
         for j in range(k_true):
             corr[i, j] = _safe_corr(w[:, i], w_true[:, j])
     rows, cols = linear_sum_assignment(-corr)
-    return float(corr[rows, cols].mean())
+    return float(corr[rows, cols].sum() / max(k_rec, k_true))
 
 
 def run_case(

@@ -300,6 +300,72 @@ instead of spending their capacity on biology. `factorized`'s `b` absorbs it for
 So on scRNA-seq you want `factorized` twice over: for the `E` gene-module readout, and because it
 measurably recovers more biology.
 
+### Choosing `K` and `d`
+
+These are not the same kind of choice. `K` is a hypothesis about your biology. `d` is an
+optimisation setting.
+
+**`d` first, because it's easy and you are probably in the wrong regime.** `d` sizes `Z (K,d)` and
+`E (M,d)`, so `rank(A_hat) <= min(K, d)` — above `d = K` it cannot change what the model
+represents. But that algebra does not predict practice. Measured at K=5, 2000 HVGs
+(`tools/select_k_and_d_scrna.py`):
+
+| d | 2 | 3 | 5 | 8 | 16 | 32 | 64 |
+|---|---|---|---|---|---|---|---|
+| w_recovery | 0.520 | 0.852 | 0.722 | 0.712 | **0.988** | 0.992 | 0.992 |
+
+The plateau is at **d≈16–32, not at d=K**. Identical rank, hugely different results: a wider
+product parametrisation is simply easier to optimise. The current sweep notebooks use
+`d ∈ [4,6,8,12]` — below the knee. **Use d=16 or 32.** Sweep it once to find the plateau, then
+hold it fixed while you sweep K; it does not interact with K the way you would assume.
+
+Two things `d` does *not* do. It does not set the dimension your cells live in — `h = w @ Z` with
+`w` on the simplex means cells occupy a **(K−1)-dimensional** hull regardless of `d`. And with
+`decoder_type="direct"` it does nothing at all (`latent_dim` is read only in the factorized
+branches, `model.py:128-129`, `:263-268`) — yet it is still fingerprinted, so sweeping `d` on a
+direct decoder silently produces one run directory per value containing identical models.
+
+**`K`: use two criteria, and distrust the fashionable one.** Against a planted `K_TRUE = 5`:
+
+| K | val_recon | dead | stability | w_recovery (oracle) |
+|---|---|---|---|---|
+| 3 | 1.2953 | 0.0 | 1.000 | 0.490 |
+| 4 | 1.3291 | 0.0 | 0.564 | 0.426 |
+| **5** | **1.1920** | 0.3 | 0.740 | **0.732** |
+| 6 | 1.2949 | 1.3 | 0.702 | 0.410 |
+| 7 | 1.5070 | 1.0 | **1.000** | 0.029 |
+| 8 | 1.2261 | 2.7 | 0.679 | 0.430 |
+
+- **`val_recon` minimum works** — it is *not* monotone in K, because early stopping plus the
+  `lambda_*` package makes excess archetypes cost you on held-out data. Check non-monotonicity on
+  your own data before trusting it; if it falls all the way to your largest K, it is not selecting.
+- **Dead archetypes work** — the largest K with none picks the truth. But use a **relative**
+  threshold (`usage < 0.5/K`). CyEmbed's `dead_archetypes_lt_1pct` is **absolute** (`w_bar < 0.01`),
+  which gets *less* strict as K rises (0.01 is 5% of uniform at K=5 but 20% at K=20), biasing you
+  toward large K.
+- **Cross-seed stability fails, and fails worst where it looks best.** It picks K=7 with a perfect
+  1.000 — where the model recovers essentially nothing (w_recovery 0.029) and has a dead archetype.
+  A degenerate solution is trivially reproducible. **Use stability to reject a K, never to select
+  one.**
+
+**Seeds are not optional, and this dominates everything above.** Two runs of the identical config
+gave `val_recon` 1.2586 and 1.3291 at K=4 — **5% run-to-run variance** from torch nondeterminism.
+The winning K beat its rivals by ~6%. On a single seed you cannot distinguish signal from noise.
+Nothing in the package varies seed, but you do not need a code change:
+
+```python
+SWEEP_GRID = {..., "seed": [7, 17, 23]}
+```
+
+`build_sweep_configs` is a cartesian product and `_config_fingerprint` includes `seed`, so each
+lands in its own run directory. Aggregate per-K across seeds and only believe a difference larger
+than the seed spread.
+
+Finally, validate the winner biologically via the UCell join (§9). It is the only criterion here
+that is not self-referential.
+
+(One synthetic regime, K_TRUE=5, 3 seeds. Evidence, not law.)
+
 ### On `model_type`: probabilistic buys less than you'd think
 
 The recipe above sweeps `probabilistic`, but be deliberate about why. On the scRNA-seq-scale
