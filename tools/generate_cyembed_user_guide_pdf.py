@@ -299,7 +299,7 @@ SECTIONS: list[tuple[str, object]] = [
         ["<b>Architecture</b>", "", "", "", ""],
         ["model_type", "deterministic", "either", "<b>deterministic</b>", "See 5.4. [measured]"],
         ["decoder_type", "factorized", "either", "<b>factorized</b>", "See 5.3. [measured]"],
-        ["K", "required", "sweep 4&ndash;10", "sweep 3&ndash;10", "The real choice. See 7."],
+        ["K", "required", "sweep 4&ndash;10", "sweep 3&ndash;10", "The real choice. See 8."],
         ["d", "required", "8&ndash;16", "<b>16&ndash;32</b>", "Optimisation, not capacity. [measured]"],
         ["hidden_dims", "(128,64)", "[128,64]", "[256,64]", "Encoder MLP widths."],
         ["dropout", "0.0", "0.0", "0.0&ndash;0.1", "Encoder hidden layers only."],
@@ -367,8 +367,113 @@ SECTIONS: list[tuple[str, object]] = [
     ])),
 
     ("pb", None),
-    ("h", "7. How to tell whether it is working"),
-    ("h", "7.1  Choosing K"),
+    ("h", "7. The NB decoder &mdash; which is not in CyEmbed"),
+    ("warn",
+     "CyEmbed cannot do this. Its reconstruction loss is mse or huber only (losses.py:17-21); "
+     "there is no negative-binomial path anywhere in the package. Pearson residuals are the "
+     "workaround that makes a Gaussian loss defensible on count data. If you want to model "
+     "counts directly you must use a DIFFERENT codebase: ProbAE_Deconv's cytof_archetypes."),
+    ("h", "7.1  Which route to take"),
+    ("t", ([1.1 * inch, 2.55 * inch, 2.55 * inch], [
+        ["", "Residuals + CyEmbed", "NB + ProbAE_Deconv"],
+        ["Likelihood", "Gaussian, constant variance, on transformed data",
+         "Negative binomial, on counts"],
+        ["Principled?", "A workaround &mdash; you transform until MSE stops being wrong",
+         "<b>Yes</b> &mdash; models the count process, no transform at all"],
+        ["Input", "X = SCT Pearson residuals", "X = <b>raw counts</b>"],
+        ["Needed for", "The mcRBM comparison (mcRBM's loss is hardcoded MSE)",
+         "Defensibility. A reviewer will prefer it, and KL-NMF-style count likelihoods are the "
+         "standard objection to the whole residual detour."],
+        ["Config", "configs/sct_gaussian_k_sweep.yaml", "configs/bck44_scrna_nb_k_sweep.yaml"],
+        ["Cells (BCK_44)", "330 (tumour-only, filtered upstream in Seurat)",
+         "352 (its own scanpy QC)"],
+    ])),
+    ("p",
+     "<b>Run both and compare.</b> If NB clearly wins, the residual transform is costing you "
+     "signal and you should know that. If they agree, the residual route is fine and you keep "
+     "access to CyEmbed and to the mcRBM comparison."),
+    ("h", "7.2  The parameters do not carry over"),
+    ("p",
+     "It is a different package with different names. Nothing in &sect;6 applies to the NB route:"),
+    ("t", ([1.7 * inch, 1.7 * inch, 2.8 * inch], [
+        ["CyEmbed", "ProbAE_Deconv (NB)", "Note"],
+        ["K", "n_archetypes", "&mdash;"],
+        ["d", "&mdash;", "No factorized/direct distinction."],
+        ["hidden_dims", "encoder_hidden_dims", "NB config uses [512,128]."],
+        ["lambda_entropy", "entropy_reg_weight", "1e-3."],
+        ["lambda_sep", "diversity_reg_weight", "1e-3."],
+        ["lambda_balance", "&mdash;", "No direct equivalent; variance_reg_weight is separate."],
+        ["epochs", "max_epochs", "5000 in the NB config."],
+        ["grad_clip_norm", "grad_clip", "1.0."],
+        ["recon_loss_type", "loss.type = nb_nll", "The whole point."],
+        ["&mdash;", "decoder_family = nb", "Selects the count decoder."],
+        ["&mdash;", "use_observed_library_size", "true &rarr; depth recomputed from X per split."],
+        ["&mdash;", "dispersion", "'gene' &mdash; one NB dispersion per gene."],
+    ])),
+    ("h", "7.3  The NB config"),
+    ("code",
+     "# configs/bck44_scrna_nb_k_sweep.yaml (abridged)\n"
+     "raw_data:   {tenx_h5: '.../BCK_44/filtered_feature_bc_matrix.h5'}\n"
+     "processed_data: {output_h5ad: 'data/bck44_scrna_hvg_counts.h5ad'}\n"
+     "qc:                                   # the NB route does its OWN scanpy QC\n"
+     "  min_genes_per_cell: 200   max_genes_per_cell: 9000\n"
+     "  max_counts_per_cell: 80000  min_counts_per_cell: 500\n"
+     "  max_pct_mt: 35.0   max_pct_ribo: 65.0   min_cells_per_gene: 3\n"
+     "  run_doublet_scoring: true  filter_strong_doublet: true  doublet_score_max: 0.35\n"
+     "hvg:    {n_top_genes: 2000, flavor: 'seurat', span: 0.3}\n"
+     "sweep:  {k_values: [4,5,6,7,8], seeds: [42]}      # <- one seed; see 8.2\n"
+     "model:\n"
+     "  type: 'archetypal_autoencoder'\n"
+     "  decoder_family: 'nb'                # <- the count decoder\n"
+     "  n_archetypes: 5\n"
+     "  encoder_hidden_dims: [512, 128]\n"
+     "  dropout: 0.1\n"
+     "  use_observed_library_size: true\n"
+     "  size_factor_key: null\n"
+     "  dispersion: 'gene'\n"
+     "data:\n"
+     "  encoder_input: 'log1p_normalized'   # a MODE, not a layer name\n"
+     "  decoder_target: 'raw_counts'        # must be exactly this\n"
+     "loss:\n"
+     "  type: 'nb_nll'\n"
+     "  entropy_reg_weight: 1.0e-3\n"
+     "  diversity_reg_weight: 1.0e-3\n"
+     "  variance_reg_weight: 0.0\n"
+     "training:\n"
+     "  batch_size: 2048   lr: 5.0e-3   weight_decay: 1.0e-4\n"
+     "  max_epochs: 5000   patience: 20   grad_clip: 1.0"),
+    ("h", "7.4  Gotchas specific to the NB route"),
+    ("t", ([1.5 * inch, 4.7 * inch], [
+        ["Gotcha", "Detail"],
+        ["<b>X must BE raw counts</b>",
+         "_prepare_nb_split clips X to &ge;0 and uses it directly as the decoder target "
+         "(trainer.py:132). Point input_path at the counts h5ad, not the residual one."],
+        ["<b>encoder_input / decoder_target are MODE STRINGS, not layer names</b>",
+         "log1p_normalized is derived arithmetically from X &mdash; x / library * 1e4 then log1p "
+         "(trainer.py:115-123). The counts and log1p_norm <b>layers in the h5ad are written for "
+         "provenance and never read.</b> This is the easiest thing here to misread."],
+        ["<b>decoder_target must be 'raw_counts'</b>",
+         "Anything else raises: 'nb decoder currently requires data.decoder_target=raw_counts' "
+         "(trainer.py:171-173)."],
+        ["<b>The preprocessing: block is IGNORED</b>",
+         "For count decoders trainer.py:174 sets preprocessor = None. So the transform / "
+         "normalization / clip_min / clip_max keys &mdash; and arcsinh_cofactor: 5.0 &mdash; in "
+         "bck44_scrna_nb_k_sweep.yaml are <b>dead config</b>. They are serialised and read by "
+         "nothing. Do not tune them expecting an effect."],
+        ["<b>Library size is recomputed from X per split</b>",
+         "use_observed_library_size: true with size_factor_key: null falls through to the "
+         "observed depth. You do not supply size factors."],
+        ["<b>Different QC &rArr; different cells</b>",
+         "The NB route runs its own scanpy QC (mito/ribo caps, doublet scoring); the SCT route "
+         "inherits tumour-only filtering from Seurat upstream. Same sample, different cell "
+         "counts (BCK_44: 352 vs 330). The two routes are not comparable cell-for-cell."],
+        ["<b>seeds: [42]</b>",
+         "The NB config sweeps a single seed, like the SCT one. Everything in &sect;8.2 applies."],
+    ])),
+
+    ("pb", None),
+    ("h", "8. How to tell whether it is working"),
+    ("h", "8.1  Choosing K"),
     ("p", "<b>[measured]</b> against a planted ground truth of K=5, 2000 HVGs:"),
     ("t", ([0.5 * inch, 1.0 * inch, 0.7 * inch, 0.95 * inch, 1.05 * inch, 1.1 * inch], [
         ["K", "mean|cos A_hat|", "val_recon", "dead", "stability", "w_rec (oracle)"],
@@ -401,7 +506,7 @@ SECTIONS: list[tuple[str, object]] = [
      "the model recovers essentially nothing (w_recovery 0.029) with a dead archetype. Every "
      "seed collapses to the SAME degenerate solution, so agreement is perfect. Use stability to "
      "reject a K, never to select one."),
-    ("h", "7.2  Seeds are not optional"),
+    ("h", "8.2  Seeds are not optional"),
     ("p",
      "<b>[measured]</b> Two runs of an identical config gave val_recon 1.2586 and 1.3291 at K=4 "
      "&mdash; <b>5% run-to-run variance</b> from torch nondeterminism alone. The winning K beat "
@@ -413,7 +518,7 @@ SECTIONS: list[tuple[str, object]] = [
      "# build_sweep_configs is a cartesian product and _config_fingerprint includes seed,\n"
      "# so each lands in its own run dir. Aggregate per-K across seeds and only believe\n"
      "# a difference larger than the seed spread."),
-    ("h", "7.3  Diagnostics to run every time"),
+    ("h", "8.3  Diagnostics to run every time"),
     ("t", ([1.3 * inch, 2.0 * inch, 2.9 * inch], [
         ["Check", "How", "Failure looks like"],
         ["Depth leakage (scRNA)", "Spearman each W[:,k] vs total counts",
@@ -432,7 +537,7 @@ SECTIONS: list[tuple[str, object]] = [
         ["Biology", "UCell signatures joined on cell_id, Spearman vs W",
          "The only criterion here that is not self-referential."],
     ])),
-    ("h", "7.4  Outputs worth reading that are easy to miss"),
+    ("h", "8.4  Outputs worth reading that are easy to miss"),
     ("t", ([1.2 * inch, 5.0 * inch], [
         ["Output", "What it tells you"],
         ["weight_entropy(W)",
@@ -456,7 +561,7 @@ SECTIONS: list[tuple[str, object]] = [
     ])),
 
     ("pb", None),
-    ("h", "8. Starting configurations"),
+    ("h", "9. Starting configurations"),
     ("h", "CyTOF (~40 markers, arcsinh-transformed)"),
     ("code",
      "GLOBAL_CFG = {'seed': 7, 'deterministic': True, 'device': 'auto'}\n"
@@ -489,7 +594,7 @@ SECTIONS: list[tuple[str, object]] = [
      "Note base_config is the <b>merge</b> {**GLOBAL_CFG, **BASE}, not the training dict alone. "
      "And skip_existing_runs / progress_sweep are read off base_config, not passed to run_sweep."),
 
-    ("h", "9. The traps, in one place"),
+    ("h", "10. The traps, in one place"),
     ("t", ([0.3 * inch, 5.9 * inch], [
         ["#", "Trap"],
         ["1", "<b>robust_zscore on sparse data</b> &rarr; &times;1e8 blowup, FloatingPointError "
@@ -514,7 +619,7 @@ SECTIONS: list[tuple[str, object]] = [
         ["14", "<b>use_sample_offset needs a stratified split</b>, or B is untrained for "
                "held-out samples."],
     ])),
-    ("h", "10. Provenance"),
+    ("h", "11. Provenance"),
     ("p",
      "Claims marked [measured] come from: tools/verify_sample_offset.py (planted-shift recovery, "
      "20 markers, 8 patients, 3 seeds); tools/verify_sample_offset_scrna.py (2000 HVGs from "
