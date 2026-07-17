@@ -391,10 +391,42 @@ SECTIONS: list[tuple[str, object]] = [
     ("p",
      "<b>Run both and compare.</b> If NB clearly wins, the residual transform is costing you "
      "signal and you should know that. If they agree, the residual route is fine and you keep "
-     "access to CyEmbed and to the mcRBM comparison."),
-    ("h", "7.2  The parameters do not carry over"),
+     "access to CyEmbed and to the mcRBM comparison. Note the two are <b>not comparable "
+     "cell-for-cell</b> &mdash; different QC gives BCK_44 352 cells one way and 330 the other, so "
+     "reconcile on cell_id first."),
+    ("h", "7.2  Why NB cannot simply be added to CyEmbed"),
     ("p",
-     "It is a different package with different names. Nothing in &sect;6 applies to the NB route:"),
+     "The obvious question is why not port NB into CyEmbed and have one tool. The answer is "
+     "structural: <b>NB and the factorized decoder are incompatible.</b>"),
+    ("p",
+     "CyEmbed decodes x_hat = w Z E.T + b &mdash; linear, and <b>signed by construction</b>. NB "
+     "needs mu &ge; 0, and there are only two ways to get it. An <b>exp link</b> "
+     "(mu = exp(w Z E.T + b) &middot; lib) moves the convex combination into log space, which "
+     "means <b>geometric</b> mixing in count space &mdash; not what archetypal analysis claims, "
+     "and not what cNMF, LDA or ProbAE do. <b>Non-negative profiles</b> "
+     "(mu = lib &middot; (w @ P) with P = softplus(Z E.T + b)) give the right arithmetic mixing, "
+     "but then A_hat is no longer a linear factorisation: rank(A_hat) &le; K stops holding, E "
+     "stops being a linear gene embedding, and &sect;5.2 evaporates."),
+    ("p",
+     "So the correct geometry costs you the factorized decoder &mdash; the configuration measured "
+     "at <b>0.818 vs direct's 0.575</b> at 2000 HVGs. You would trade CyEmbed's one measured "
+     "architectural advantage to gain NB. ProbAE gets the right geometry precisely <i>because</i> "
+     "it learns the archetype profile directly as (K, M) and softmaxes it over genes "
+     "(probabilistic_archetypal_ae.py:80-90): rho = softmax(archetype_logits, dim=-1); "
+     "rho_i = w @ rho; mu = lib &middot; rho_i. A (K,M) profile is what NB wants; a factorized "
+     "Z@E.T is what NB cannot have."),
+    ("p",
+     "<b>If you need NB and per-sample correction together</b> &mdash; a combination that exists "
+     "nowhere today, since ProbAE has no batch/patient conditioning of any kind &mdash; the cheap "
+     "edit is in ProbAE, not CyEmbed. About five lines in _decode_nb: "
+     "mu = clamp(lib &middot; rho_i &middot; exp(B_eff[s]), min=1e-8). Multiplicative in count "
+     "space is additive in log space, the correct count-model analogue of CyEmbed's "
+     "additive-in-residual-space B, and what scVI does for batch. Reuse the rest of the design "
+     "validated here: B created only when enabled, centred zero-sum, warm-started at the "
+     "empirical per-sample mean, out of weight decay, stratified split."),
+    ("h", "7.3  The parameters do not carry over"),
+    ("p",
+     "A different package with different names. Nothing in &sect;6 applies to the NB route:"),
     ("t", ([1.7 * inch, 1.7 * inch, 2.8 * inch], [
         ["CyEmbed", "ProbAE_Deconv (NB)", "Note"],
         ["K", "n_archetypes", "&mdash;"],
@@ -410,7 +442,7 @@ SECTIONS: list[tuple[str, object]] = [
         ["&mdash;", "use_observed_library_size", "true &rarr; depth recomputed from X per split."],
         ["&mdash;", "dispersion", "'gene' &mdash; one NB dispersion per gene."],
     ])),
-    ("h", "7.3  The NB config"),
+    ("h", "7.4  The NB config"),
     ("code",
      "# configs/bck44_scrna_nb_k_sweep.yaml (abridged)\n"
      "raw_data:   {tenx_h5: '.../BCK_44/filtered_feature_bc_matrix.h5'}\n"
@@ -442,7 +474,7 @@ SECTIONS: list[tuple[str, object]] = [
      "training:\n"
      "  batch_size: 2048   lr: 5.0e-3   weight_decay: 1.0e-4\n"
      "  max_epochs: 5000   patience: 20   grad_clip: 1.0"),
-    ("h", "7.4  Gotchas specific to the NB route"),
+    ("h", "7.5  Gotchas specific to the NB route"),
     ("t", ([1.5 * inch, 4.7 * inch], [
         ["Gotcha", "Detail"],
         ["<b>X must BE raw counts</b>",
