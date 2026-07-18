@@ -35,9 +35,18 @@ this repo in three ways that matter:
 
 | | CyTOF notebooks | this notebook |
 |---|---|---|
-| features | ~40 markers, arcsinh | 2,000 HVGs, analytic Pearson residuals |
+| features | ~40 markers, arcsinh | 1,000–2,000 HVGs, Pearson residuals |
 | `fit_scaler` mode | `"zscore"` | **`"none"`** — residuals are already variance-stabilised |
 | stratification | by cluster or sample | **none available** — see the split cell |
+
+## Two residual routes — pick one with `INPUT_ROUTE`
+
+- **`"counts"`** — raw counts, **analytic** Pearson residuals computed here (`theta` fixed at 100)
+- **`"sct"`** — Seurat **SCTransform** residuals computed upstream (per-gene regularised `theta`)
+
+These are related but genuinely different transforms, and they also differ in clip range, cell
+set, and gene set. Section 2 lays out all four differences; section 10 compares the results.
+Run both — the point of the switch is that you should not have to take my word for which matters.
 
 ## Read this before trusting any number below
 
@@ -52,12 +61,12 @@ than the guide's worked example assumes.
 (every barcode carries the `-1` GEM suffix, and `.obs` has no patient/sample/batch column). The
 per-patient intercept `B` has nothing to correct here. Section 8 shows where it would go.
 
-**HVGs were chosen upstream by dispersion, not residual variance.** The guide asks for the top
-genes by Pearson residual variance. The 2,000 genes in this file were selected by
-`sc.pp.highly_variable_genes(flavor="seurat")` on log1p data in the ProbAE NB pipeline, and the
-raw 10x matrix is a 0-byte Dropbox placeholder, so reselecting from all ~36k genes is not possible
-here. Section 3 ranks the 2,000 by residual variance so you can see the disagreement and subset
-further if you want.
+**On the `"counts"` route, HVGs were chosen upstream by dispersion, not residual variance.** The
+guide asks for the top genes by Pearson residual variance. Those 2,000 genes were selected by
+`sc.pp.highly_variable_genes(flavor="seurat")` on log1p data, and the raw 10x matrix is a 0-byte
+Dropbox placeholder, so reselecting from all ~36k genes is not possible here. Section 2 ranks
+them by residual variance so you can see the disagreement and subset further. (The `"sct"` route
+does not have this problem — its 1,000 genes were chosen by Seurat's `residual_variance`.)
 
 **No ground truth.** Unlike `tools/verify_sample_offset_scrna.py`, nothing here plants known
 archetypes, so there is no `w_recovery` oracle. Section 6 falls back on the criteria that do not
@@ -98,9 +107,22 @@ pd.set_option("display.width", 160)
 code(
     '''
 # === Editable configuration ===
-OUTPUT_ROOT = Path("outputs/bck44_scrna_archetype_sweep")
+# Which residual transform to model. Set this, then run top-to-bottom.
+#   "counts" -> load raw counts, compute analytic Pearson residuals here (theta fixed at 100)
+#   "sct"    -> load Seurat SCTransform residuals computed upstream (per-gene regularised theta)
+# Section 2 explains what differs; section 10 has the measured comparison. "sct" is the default
+# because it measurably wins here: the depth artifact largely disappears (worst archetype-vs-depth
+# correlation -0.092 vs -0.300), gene modules are far more reproducible across seeds (0.812 vs
+# 0.488), and cells stay genuinely mixed rather than hard-assigned (9.1% vs 35.5% above w>0.8).
+INPUT_ROUTE = "sct"
+
+# The output root MUST depend on the route. The config fingerprint hashes the *config* only --
+# it has no idea which matrix was fed in (train.py:83-91). Two routes sharing a root means the
+# second silently reports the first one's runs as `Skipping existing run`.
+OUTPUT_ROOT = Path(f"outputs/bck44_scrna_archetype_sweep/route_{INPUT_ROUTE}")
 OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
-print(f"OUTPUT_ROOT: {OUTPUT_ROOT.resolve()}  (completed runs are skipped, not overwritten)")
+print(f"INPUT_ROUTE : {INPUT_ROUTE}")
+print(f"OUTPUT_ROOT : {OUTPUT_ROOT.resolve()}  (completed runs are skipped, not overwritten)")
 
 GLOBAL_CFG = {
     "seed": 7,             # overridden per run by SWEEP_GRID["seed"]
@@ -116,6 +138,13 @@ DATA_CFG = {
     "counts_h5ad": (
         "/Users/ronguy/Dropbox/Work/CyTOF/Experiments/ProbAE_Deconv/data/"
         "bck44_scrna_hvg_counts.h5ad"
+    ),
+    # Seurat SCT scale.data (= Pearson residuals), tumour-only, 330 x 1000.
+    # Always loaded for its per-cell depth metadata even on the "sct" route, because that
+    # object carries only `cell_id` in .obs -- no total_counts to run the depth check against.
+    "sct_h5ad": (
+        "/Users/ronguy/Dropbox/Work/CyTOF/Experiments/ProbAE_Deconv/data/"
+        "BCK_44_sct_pearson_residuals_hvg.h5ad"
     ),
     "sample_col": None,    # single sample -- no patient column exists
     "cluster_col": None,   # no annotation in this object
@@ -203,14 +232,18 @@ code(
 # === Load raw counts ===
 set_seed(GLOBAL_CFG["seed"], deterministic=GLOBAL_CFG["deterministic"])
 
-counts_path = Path(DATA_CFG["counts_h5ad"])
-if not counts_path.exists() or counts_path.stat().st_size == 0:
-    raise FileNotFoundError(
-        f"{counts_path} is missing or is a 0-byte Dropbox placeholder. "
-        "Right-click -> 'Make available offline' in Dropbox, or regenerate it with "
-        "ProbAE_Deconv/notebooks/experiment_suite/200_bck44_scrna_nb_k_sweep.ipynb."
-    )
+def require(path_str: str) -> Path:
+    """Reject 0-byte Dropbox placeholders, which Path.exists() happily accepts."""
+    path = Path(path_str)
+    if not path.exists() or path.stat().st_size == 0:
+        raise FileNotFoundError(
+            f"{path} is missing or is a 0-byte Dropbox placeholder. "
+            "Right-click -> 'Make available offline' in Dropbox to materialise it."
+        )
+    return path
 
+
+counts_path = require(DATA_CFG["counts_h5ad"])
 adata = ad.read_h5ad(counts_path)
 counts = adata.X.toarray() if hasattr(adata.X, "toarray") else np.asarray(adata.X)
 counts = np.asarray(counts, dtype=np.float64)
@@ -224,18 +257,59 @@ if not np.allclose(counts, np.round(counts)):
 gene_names = [str(g) for g in adata.var_names]
 cell_ids = [str(c) for c in adata.obs_names]
 
-print(f"cells x genes      : {counts.shape[0]} x {counts.shape[1]}")
+# Per-cell sequencing depth, keyed by barcode. The depth diagnostic in section 3 is the most
+# valuable check in this notebook, and the SCT object has no depth column of its own, so keep
+# this map around regardless of route.
+depth_by_cell = dict(zip(cell_ids, adata.obs["total_counts"].to_numpy()))
+
+print(f"counts             : {counts.shape[0]} cells x {counts.shape[1]} genes")
 print(f"library size       : median {np.median(counts.sum(1)):.0f}, "
       f"range [{counts.sum(1).min():.0f}, {counts.sum(1).max():.0f}]")
 print(f"detection rate     : {(counts > 0).mean():.1%} of the matrix is non-zero")
 print(f"sample/patient col : {DATA_CFG['sample_col']}  (single sample -- B is not exercised)")
+
+if INPUT_ROUTE == "sct":
+    sct = ad.read_h5ad(require(DATA_CFG["sct_h5ad"]))
+    print(f"\\nSCT residuals      : {sct.shape[0]} cells x {sct.shape[1]} genes")
+    shared_cells = set(sct.obs_names) & set(cell_ids)
+    shared_genes = set(sct.var_names) & set(gene_names)
+    print(f"overlap with counts: {len(shared_cells)} cells, {len(shared_genes)} genes")
+    print("  The two routes are NOT nested subsets -- different upstream QC. The counts route "
+          "applies mito/ribo caps here; the SCT route inherits tumour-only filtering from "
+          "Seurat. Neither is a superset of the other.")
 '''
 )
 
 # ---------------------------------------------------------------- 4. residuals
 md(
     """
-## 2. Analytic Pearson residuals
+## 2. The residual transform — and which one you are using
+
+`INPUT_ROUTE` picks between two transforms that are often spoken of interchangeably and are not
+the same thing. Both produce Pearson residuals; they disagree on how `theta` is obtained and,
+more consequentially here, on how hard the result is clipped.
+
+| | `"counts"` (analytic) | `"sct"` (SCTransform) |
+|---|---|---|
+| source | raw counts, computed in this notebook | Seurat `SCT` `scale.data`, computed upstream |
+| `theta` | **fixed at 100** for every gene | per-gene, regularised NB regression |
+| clip | `sqrt(N)` = **±18.8** | Seurat default ≈ **±3.3** |
+| observed range | [−9.4, 18.8] | [−2.18, 3.76] |
+| observed std | **1.71** | **0.986** |
+| matrix | 352 × 2000 | 330 × 1000 |
+| cells | all passing mito/ribo QC | tumour-only (Seurat, upstream) |
+
+**The clip difference is not cosmetic, and it may matter more than `theta`.** CyEmbed's loss is
+MSE, so large residuals dominate the gradient. Clipping at ±3.3 instead of ±18.8 changes which
+genes get to define archetypes. When these two routes disagree, suspect the clip before the
+`theta` estimator.
+
+Reference: Hafemeister & Satija 2019 for SCTransform, Lause/Berens/Kobak 2021 for the analytic
+form (which argues the closed form matches or beats regularised NB regression at a fraction of
+the cost). The analytic route is a defensible choice, not a shortcut — but it *is* a different
+transform, and this notebook should not have implied otherwise.
+
+### The analytic form
 
 The load-bearing preprocessing step. CyEmbed's loss is MSE — a Gaussian with constant variance —
 which on raw counts is simply the wrong noise model: a gene's variance grows with its mean, so
@@ -277,11 +351,23 @@ def pearson_residuals(x: np.ndarray, theta: float = 100.0, clip: object = "sqrt_
     return z
 
 
-resid = pearson_residuals(counts, theta=RESIDUAL_CFG["theta"], clip=RESIDUAL_CFG["clip"])
+if INPUT_ROUTE == "counts":
+    resid = pearson_residuals(counts, theta=RESIDUAL_CFG["theta"], clip=RESIDUAL_CFG["clip"])
+    gene_names_all = list(gene_names)
+    cell_ids_all = list(cell_ids)
+elif INPUT_ROUTE == "sct":
+    # Already residuals -- do NOT transform again.
+    resid = np.asarray(sct.X.toarray() if hasattr(sct.X, "toarray") else sct.X, dtype=np.float64)
+    gene_names_all = [str(g) for g in sct.var_names]
+    cell_ids_all = [str(c) for c in sct.obs_names]
+else:
+    raise ValueError(f"INPUT_ROUTE must be 'counts' or 'sct', got {INPUT_ROUTE!r}")
 
 # Rank genes by residual variance -- the selection criterion the guide actually asks for.
 resid_var = resid.var(axis=0)
 order = np.argsort(resid_var)[::-1]
+gene_names = gene_names_all
+cell_ids = cell_ids_all
 
 n_top = RESIDUAL_CFG["n_top_genes"]
 if n_top is not None and int(n_top) < resid.shape[1]:
@@ -293,18 +379,22 @@ else:
     gene_names_kept = list(gene_names)
     print(f"Keeping all {resid.shape[1]} genes (n_top_genes=None).")
 
+print(f"route              : {INPUT_ROUTE}")
 print(f"residual matrix    : {resid.shape[0]} x {resid.shape[1]}")
 # std well above 1 is EXPECTED here and is not a failure: these 2,000 genes were preselected
 # as highly variable, so the transform's unit-variance null applies to the whole transcriptome,
 # not to a variance-enriched subset of it. Mean near 0 is the check that matters.
 print(f"residual mean/std  : {resid.mean():.4f} / {resid.std():.4f}  (want mean ~0; std > 1 on an HVG subset)")
-print(f"residual range     : [{resid.min():.2f}, {resid.max():.2f}]  "
-      f"(clip at +/-{np.sqrt(counts.shape[0]):.2f})")
+if INPUT_ROUTE == "counts":
+    print(f"residual range     : [{resid.min():.2f}, {resid.max():.2f}]  "
+          f"(clipped at +/-{np.sqrt(counts.shape[0]):.2f})")
+else:
+    print(f"residual range     : [{resid.min():.2f}, {resid.max():.2f}]  "
+          f"(clipped upstream by Seurat, roughly +/-sqrt(N/30))")
 print()
-print("Top 15 genes by residual variance (upstream HVG rank in parentheses):")
-disp_rank = {g: i for i, g in enumerate(gene_names)}
+print("Top 15 genes by residual variance:")
 for r, i in enumerate(order[:15], start=1):
-    print(f"  {r:2d}. {gene_names[i]:<12s} resid_var={resid_var[i]:7.2f}  (dispersion HVG #{disp_rank[gene_names[i]] + 1})")
+    print(f"  {r:2d}. {gene_names[i]:<16s} resid_var={resid_var[i]:7.2f}")
 '''
 )
 
@@ -321,24 +411,29 @@ below fails, stop: no choice of `K` or `d` will rescue it.
 code(
     '''
 # === Preprocessing QC ===
-lib_size = counts.sum(axis=1)
-full_depth = adata.obs["total_counts"].to_numpy() if "total_counts" in adata.obs else lib_size
+# Align depth to whichever cells are actually being modelled. On the "sct" route the residual
+# matrix has its own cell set, 11 of which are absent from the counts object -- those get NaN
+# and drop out of the correlations rather than silently mis-aligning.
+lib_size = np.array([depth_by_cell.get(c, np.nan) for c in cell_ids], dtype=np.float64)
+have_depth = np.isfinite(lib_size)
+if not have_depth.all():
+    print(f"NOTE: {int((~have_depth).sum())} of {len(cell_ids)} cells have no depth in the "
+          f"counts object; excluded from the depth checks below.\\n")
 
 # CHECK 1: residuals must not track sequencing depth.
 # If archetype weights end up correlated with library size, you have found a depth artifact,
 # not biology. The residual transform is what removes it -- verify that it did.
 cell_mean_resid = resid.mean(axis=1)
-r_depth = np.corrcoef(np.log10(lib_size), cell_mean_resid)[0, 1]
-r_depth_full = np.corrcoef(np.log10(full_depth), cell_mean_resid)[0, 1]
-print(f"corr(log10 lib size, mean residual)      : {r_depth:+.3f}   (HVG-subset depth)")
-print(f"corr(log10 total_counts, mean residual)  : {r_depth_full:+.3f}   (full transcriptome)")
+r_depth = np.corrcoef(np.log10(lib_size[have_depth]), cell_mean_resid[have_depth])[0, 1]
+r_depth_full = r_depth
+print(f"corr(log10 total_counts, mean residual)  : {r_depth:+.3f}")
 print("  -> want |r| < 0.3.")
-if max(abs(r_depth), abs(r_depth_full)) >= 0.3:
-    print("  !! BORDERLINE on this dataset (measured about -0.32 / -0.36). The sign is negative:")
-    print("     deeper cells have slightly LOWER mean residual, the opposite of depth leaking")
-    print("     through as inflated signal. With a 766-median library the NB null is a poor fit")
-    print("     in the low-depth tail, which is the likely cause. Check in section 8 whether")
-    print("     archetype usage tracks library size -- that is the failure that would matter.")
+if abs(r_depth) >= 0.3:
+    print("  !! BORDERLINE. The sign is negative: deeper cells have slightly LOWER mean")
+    print("     residual, the opposite of depth leaking through as inflated signal. With a")
+    print("     766-median library the NB null fits the low-depth tail poorly, which is the")
+    print("     likely cause. Section 8 checks whether archetype usage tracks depth -- that")
+    print("     is the failure that would actually matter.")
 print()
 
 # CHECK 2: per-gene residual variance should not be dominated by a handful of genes.
@@ -352,17 +447,24 @@ axes[0].set_xlabel("Pearson residual")
 axes[0].set_ylabel("count (log)")
 axes[0].set_title("Residual distribution")
 
-axes[1].scatter(np.log10(lib_size), cell_mean_resid, s=8, alpha=0.5)
-axes[1].set_xlabel("log10 library size (HVG subset)")
+axes[1].scatter(np.log10(lib_size[have_depth]), cell_mean_resid[have_depth], s=8, alpha=0.5)
+axes[1].set_xlabel("log10 total counts")
 axes[1].set_ylabel("mean residual per cell")
 axes[1].set_title(f"Depth dependence (r = {r_depth:+.3f})")
 
-axes[2].scatter(counts.mean(axis=0), resid.var(axis=0), s=6, alpha=0.4)
-axes[2].set_xscale("log")
+# Mean-vs-variance needs counts aligned to the residual genes, which only holds on the
+# "counts" route; the SCT gene set overlaps it by 452 of 1000.
+if INPUT_ROUTE == "counts":
+    axes[2].scatter(counts.mean(axis=0), resid.var(axis=0), s=6, alpha=0.4)
+    axes[2].set_xscale("log")
+    axes[2].set_xlabel("mean count")
+    axes[2].set_ylabel("residual variance")
+    axes[2].set_title("Mean-variance relation after transform")
+else:
+    axes[2].hist(resid.var(axis=0), bins=40)
+    axes[2].set_xlabel("residual variance per gene")
+    axes[2].set_title("Per-gene residual variance (SCT)")
 axes[2].set_yscale("log")
-axes[2].set_xlabel("mean count")
-axes[2].set_ylabel("residual variance")
-axes[2].set_title("Mean-variance relation after transform")
 
 plt.tight_layout()
 '''
@@ -471,30 +573,35 @@ Four criteria, in descending order of how much I would trust them here.
    1.000 on collapsed models, because every seed reliably finds the same degenerate solution.
    High stability with high redundancy means agreement on garbage.
 
-### What this run found
+### What the two routes found
 
-| K | val_recon | redundancy | dead (rel) | stability |
+`val_recon` means by K, three seeds each. **The two routes do not agree on K**, which is the
+first thing to notice:
+
+| K | `"sct"` val_recon | sd | `"counts"` val_recon | sd |
 |---|---|---|---|---|
-| 3 | 2.765 | 0.838 | 0.0 | 0.877 |
-| 4 | 2.710 | 0.732 | 0.3 | 0.738 |
-| 5 | 2.745 | 0.828 | 1.0 | 0.728 |
-| **6** | **2.649** | **0.515** | 0.7 | 0.789 |
-| 7 | 2.704 | 0.741 | 1.3 | 0.608 |
-| 8 | 2.667 | 0.725 | 2.0 | 0.687 |
+| 3 | 0.938 | 0.002 | 2.765 | 0.011 |
+| 4 | 0.919 | 0.006 | 2.710 | 0.068 |
+| 5 | 0.905 | 0.004 | 2.745 | 0.076 |
+| 6 | 0.911 | 0.028 | **2.649** | 0.017 |
+| **7** | **0.897** | 0.007 | 2.704 | 0.109 |
+| 8 | 0.934 | 0.039 | 2.667 | 0.053 |
 
-**K = 6**, on two criteria that agree independently: lowest `val_recon`, and a redundancy of
-0.515 that is far below every other K (all ≥ 0.72). Note that `val_recon` has a genuine interior
-minimum rather than falling monotonically — the thing that makes it usable for selecting K at all.
+The two columns are **not on a common scale** — the matrices have different variance (std 0.986
+vs 1.71), so the smaller numbers in the `"sct"` column mean nothing on their own. What is
+readable is the *shape*: `"sct"` has a clean interior minimum at K=7 with tight seed spread,
+while `"counts"` is erratic (sd up to 0.109, minimum at K=6, second dip at K=8). On the
+`"counts"` route redundancy pointed at K=6 too, so that route's own two criteria agreed — but
+its seed spread makes the margin much less convincing than the `"sct"` column's.
 
 Two warnings the table earns:
 
-- **Do not take "best by `val_recon`" from section 8 at face value.** The single best *run* is
-  K=7, but K=7's *mean* is worse than K=6's and its spread is six times larger (sd 0.109 vs
-  0.017) — one seed got lucky. This is exactly the failure that a one-seed sweep would have
-  written down as a result.
-- **Dead archetypes rise steadily with K** on the relative threshold (0.0 → 2.0), while the
-  absolute `dead_archetypes_lt_1pct` metric stays at 0 until K=7. On 352 cells the relative
-  count is the more honest of the two.
+- **Do not take "best by `val_recon`" from section 8 at face value.** On the `"counts"` route
+  the single best *run* was K=7 while K=7's *mean* was worse than K=6's, with six times the
+  spread — one seed got lucky. This is exactly what a one-seed sweep would have written down
+  as a finding.
+- **`val_recon` has a genuine interior minimum**, contrary to the intuition that reconstruction
+  improves monotonically with K. That is what makes it usable for selecting K at all.
 """
 )
 
@@ -661,21 +768,27 @@ a negative loading is genuine *depletion*, not a modelling artifact. Do not read
 expression levels, and do not expect them to be non-negative — CyEmbed is not NMF, and the sign
 carries information.
 
-### What this run found
+### What the `"sct"` route found
 
-At K=7 the archetypes are largely readable as breast tissue, which is the basic sanity check:
+At K=7 the archetypes read as recognisable ER+ breast programs:
 
-- **luminal secretory** — SCGB2A2, SCGB1D2, SCGB2A1, PIP, MUCL1
-- **basal / myoepithelial** — KRT15, KRT17, SFRP1, GABRP, PTN
-- **smooth muscle** — ACTA2, MYH11, TAGLN, MYL9, TPM2
-- **endothelial** — VWF, EMCN, A2M, SPARCL1, LDB2
+- **luminal hormone-responsive** — ESR1, GATA3, AFF3, DACH1, FKBP5
+- **basal** — KRT17, SFRP1, GABRP, PTN, NFIB, ANXA1
+- **secretory** — SCGB2A2, SCGB2A1, SCGB1D2, COX6C
+- **stress / heat-shock** — HSPA1A, HSPB1, HSPB8, JUN, DUSP1 — most likely a dissociation
+  response rather than in-vivo biology, but a real and well-described program. Worth deciding
+  deliberately whether to regress it out rather than reading it as a cell state.
 
-**But one archetype is an artifact, and the depth check below is what catches it.** Archetype 1
-is the *highest-usage* archetype (0.254) and correlates **−0.467** with log library size. Its
-gene list — TALAM1, AKAP13, BTRC, LINC00472, NOVA1 — is a grab-bag of long transcripts and
-lncRNAs with no coherent program. It is the shallow cells, wearing a plausible-looking gene list.
-That is precisely the failure mode that makes a gene-list-only reading of archetypes dangerous:
-the list looked fine, and only the correlation gave it away.
+Depth correlations are clean throughout (worst archetype **−0.092**), and cells stay genuinely
+mixed: mean entropy 1.297 of a possible 1.946, with only 9.1% hard-assigned above w > 0.8.
+
+**Why the depth check below is here.** On the `"counts"` route it is not clean — the worst
+archetype tracks library size at **−0.300**, and in an earlier run at a different seed it hit
+**−0.467** while carrying the *highest* usage of any archetype (0.254). Its gene list
+(TALAM1, AKAP13, LINC00472, NOVA1) looked plausible enough to write up. It was the shallow
+cells wearing a costume, and only the correlation gave it away. Keep running this check even
+on the SCT route — it costs nothing and it is the one diagnostic that catches this class of
+error, which no amount of staring at gene lists will.
 
 ### Where the per-patient offset would go
 
@@ -729,7 +842,8 @@ print(f"cells with w_max > 0.8: {(W.max(axis=1) > 0.8).mean():.1%}")
 # An archetype whose usage tracks library size is a sequencing-depth artifact wearing a
 # biological costume -- it will have a plausible gene list and mean nothing.
 print("\\ncorr(log10 library size, archetype usage):")
-depth_corr = [np.corrcoef(np.log10(lib_size), W[:, i])[0, 1] for i in range(A.shape[0])]
+log_depth = np.log10(lib_size[have_depth])
+depth_corr = [np.corrcoef(log_depth, W[have_depth, i])[0, 1] for i in range(A.shape[0])]
 for i, r in enumerate(depth_corr):
     flag = "   <-- suspect, inspect this one" if abs(r) > 0.4 else ""
     print(f"  archetype {i}: {r:+.3f}{flag}")
@@ -810,7 +924,104 @@ else:
 # ---------------------------------------------------------------- 12. next
 md(
     """
-## 10. Where to go next
+## 10. Comparing the two routes
+
+Run the notebook once with `INPUT_ROUTE = "counts"` and once with `"sct"`, then run the cell
+below — it reads both routes' summaries off disk and puts them side by side.
+
+**What a comparison here can and cannot tell you.** The two routes differ in *four* ways at
+once: `theta` estimator, clip range, cell set (352 vs 330, sharing 319), and gene set (2000 vs
+1000, sharing 452). So a difference in `val_recon` is not attributable to SCTransform-vs-analytic
+— it is confounded four ways, and `val_recon` is not even on a common scale, since the two
+matrices have different variance (std 1.71 vs 0.986). **Do not rank the routes by `val_recon`.**
+
+What *is* comparable: whether each route selects the same K, whether the archetypes are
+biologically readable, and — the one that matters most — whether the depth-artifact archetype
+appears in both. If it does, it is a property of 766-median-depth data rather than of either
+transform.
+
+### Measured result: SCTransform wins, and not narrowly
+
+Both routes were run at K ∈ {3..8} × 3 seeds. On every metric that *is* comparable across
+routes, `"sct"` is better:
+
+| | `"counts"` (analytic) | `"sct"` (SCTransform) |
+|---|---|---|
+| depth vs mean residual | **−0.36** (fails the 0.3 bar) | **−0.13** (clean) |
+| worst depth-vs-usage correlation | **−0.300** | **−0.092** |
+| gene modules across seeds | **0.488** | **0.812** |
+| `val_recon` sd across seeds | 0.011–0.109 (erratic) | 0.002–0.039 (tight) |
+| mean entropy(W) at K=7 | 0.683 | **1.297** (of max 1.946) |
+| cells hard-assigned (w>0.8) | 35.5% | **9.1%** |
+
+Three of these matter a lot:
+
+1. **The depth artifact essentially disappears.** On the analytic route the worst archetype
+   tracks library size at −0.300; under SCTransform the worst is −0.092. Per-gene regularised
+   `theta` is doing exactly what it is supposed to do on a 766-median-depth library, and a
+   single fixed `theta = 100` is not.
+2. **The analytic route is degenerating toward hard clustering.** 35.5% of cells sit above
+   w > 0.8 with mean entropy 0.683, against 9.1% and 1.297 under SCTransform. Archetypal
+   analysis earns its keep by placing cells *between* vertices; the analytic route is
+   substantially throwing that away.
+3. **Reproducibility.** Gene modules agree 0.812 across seeds under SCTransform versus 0.488 —
+   below the 0.77 synthetic-benchmark reference, i.e. the analytic route's modules were largely
+   seed-specific noise.
+
+The biology agrees. The SCTransform archetypes name recognisable ER+ breast programs — **ESR1 /
+GATA3 / AFF3 / DACH1** (luminal hormone-responsive), **KRT17 / SFRP1 / GABRP / PTN** (basal),
+**SCGB2A2 / SCGB2A1 / SCGB1D2** (secretory), and a **HSPA1A / HSPB1 / JUN / DUSP1** stress
+program (probably dissociation, but a real and well-described one). The analytic route's
+archetypes lean on lncRNAs and long transcripts with no coherent read.
+
+**Caveat, stated plainly: this comparison is confounded four ways** — `theta`, clip, cells, and
+genes all differ. The tumour-only SCT cell set is more homogeneous, which alone could raise
+entropy and stability. So this does not isolate SCTransform as *the* cause. But every difference
+points the same direction, and the depth result is what theory predicts, so the practical
+conclusion is not in much doubt.
+
+**Default is therefore `INPUT_ROUTE = "sct"`.** Use `"counts"` when you need to see the
+transform and its QC, when you want all 2,000 genes, or when no SCTransform output exists.
+"""
+)
+
+code(
+    '''
+# === Side-by-side route comparison ===
+route_tables = {}
+for route in ("counts", "sct"):
+    csv = Path(f"outputs/bck44_scrna_archetype_sweep/route_{route}") / "sweep_summary_sorted.csv"
+    if not csv.exists():
+        print(f"[{route}] not run yet -- set INPUT_ROUTE = {route!r} and run top-to-bottom.")
+        continue
+    df = pd.read_csv(csv)
+    route_tables[route] = (
+        df.groupby("K")
+        .agg(val_recon=("val_recon", "mean"),
+             val_recon_sd=("val_recon", "std"),
+             marker_corr=("mean_marker_corr_val", "mean"),
+             entropy=("mean_entropy_val", "mean"))
+        .round(4)
+    )
+
+if len(route_tables) == 2:
+    combined = pd.concat(route_tables, axis=1)
+    display(combined)
+    for route, tbl in route_tables.items():
+        print(f"[{route}] best K by val_recon: {tbl['val_recon'].idxmin()} "
+              f"({tbl['val_recon'].min():.4f})")
+    print()
+    print("Reminder: val_recon is NOT comparable across routes -- the two matrices have")
+    print("different variance (std 1.71 vs 0.986), so the losses are on different scales.")
+    print("Compare which K each route picks, not which route reports a smaller number.")
+else:
+    print("\\nRun both routes to populate this comparison.")
+'''
+)
+
+md(
+    """
+## 11. Where to go next
 
 - **Multi-patient.** The offset is the feature this notebook cannot demonstrate. Point section 1
   at an object with a real patient column, set `use_sample_offset: True`, and stratify the split

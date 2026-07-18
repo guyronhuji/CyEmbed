@@ -84,6 +84,48 @@ SCTransform already normalised away.
 This is why the existing sweep config sets `transform: "none"` and `normalization: "none"` with
 the comment *"SCT Pearson residuals are already ~N(0,1) per gene."* Follow it.
 
+### Which Pearson residuals? SCTransform and the analytic form are not the same thing
+
+"Pearson residuals" covers two transforms that are routinely spoken of interchangeably:
+
+- **SCTransform** (Hafemeister & Satija 2019) — per-gene `theta` from regularized NB regression,
+  kernel-smoothed across genes. Seurat's `SCT` `scale.data`.
+- **Analytic Pearson residuals** (Lause/Berens/Kobak 2021) — closed form with a single fixed
+  `theta` (usually 100). Much faster, and the paper argues it matches or beats the regularized
+  fit.
+
+They also differ in a detail that is easy to miss and matters here: **clip range**. Seurat clips
+to roughly `±sqrt(N/30)` (≈±3.3 at N=330); the usual analytic convention is `±sqrt(N)` (≈±18.8 at
+N=352). Since CyEmbed's loss is MSE, large residuals dominate the gradient — so when the two
+disagree, suspect the clip before the `theta` estimator.
+
+**Measured on BCK_44** (`01_bck44_scrna_archetype_embedding_sweep.ipynb`, K ∈ {3..8} × 3 seeds,
+both routes), SCTransform won clearly:
+
+| | analytic (`theta=100`) | SCTransform |
+|---|---|---|
+| worst archetype-vs-depth correlation | −0.300 | **−0.092** |
+| gene modules across seeds | 0.488 | **0.812** |
+| `val_recon` sd across seeds | 0.011–0.109 | **0.002–0.039** |
+| mean entropy(W) at K=7 | 0.683 | **1.297** (max 1.946) |
+| cells hard-assigned (w > 0.8) | 35.5% | **9.1%** |
+
+Two of those are close to disqualifying for the analytic route on this dataset. The depth
+artifact is the serious one — a fixed `theta = 100` left the *highest-usage* archetype tracking
+library size, with a plausible-looking gene list. And 35.5% of cells hard-assigned means the
+analytic route was degenerating toward hard clustering, discarding the between-vertex mixing
+that is the point of archetypal analysis.
+
+**Caveat: confounded four ways** on this data — `theta`, clip, cell set (352 vs 330), and gene
+set (2000 vs 1000) all differ, and the SCT cells are tumour-only and so more homogeneous. This
+does not isolate SCTransform as the cause. But every difference points the same way and the
+depth result is what theory predicts.
+
+**Recommendation: use SCTransform residuals when you have them.** Reach for the analytic form
+when you need to compute residuals from counts inside the pipeline, want all your HVGs rather
+than an upstream subset, or have no Seurat output — and when you do, run the depth diagnostic
+below before trusting any archetype.
+
 ### `robust_zscore` is broken on sparse data — do not use it
 
 This one will bite hard and it is worth understanding rather than just avoiding.
