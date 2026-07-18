@@ -94,10 +94,22 @@ the comment *"SCT Pearson residuals are already ~N(0,1) per gene."* Follow it.
   `theta` (usually 100). Much faster, and the paper argues it matches or beats the regularized
   fit.
 
-They also differ in a detail that is easy to miss and matters here: **clip range**. Seurat clips
-to roughly `±sqrt(N/30)` (≈±3.3 at N=330); the usual analytic convention is `±sqrt(N)` (≈±18.8 at
-N=352). Since CyEmbed's loss is MSE, large residuals dominate the gradient — so when the two
-disagree, suspect the clip before the `theta` estimator.
+They also differ in a detail that is easy to miss and matters here: **clip range**. Since
+CyEmbed's loss is MSE, large residuals dominate the gradient, so the clip changes which genes get
+to define archetypes — when two routes disagree, suspect the clip before the `theta` estimator.
+
+**The clip is an entry-point choice, not a property of SCTransform.** Verified against
+`sctransform` 0.4.2:
+
+| entry point | default `res_clip_range` |
+|---|---|
+| `sctransform::vst` | `c(-sqrt(ncol(umi)), sqrt(ncol(umi)))` — i.e. `sqrt(N)` |
+| Seurat `SCTransform` wrapper | `sqrt(N/30)` |
+| analytic convention (Lause et al.) | `sqrt(N)` |
+
+So `vst` called directly clips the *same* way as the analytic route, and only the Seurat wrapper
+tightens it. `BCK_44_sct_pearson_residuals_hvg.h5ad` maxes at 3.76, consistent with the wrapper
+running on ~424 cells (`sqrt(424/30) = 3.76`) before the tumour-only subset to 330.
 
 **Measured on BCK_44** (`01_bck44_scrna_archetype_embedding_sweep.ipynb`, K ∈ {3..8} × 3 seeds,
 both routes), SCTransform won clearly:
@@ -561,6 +573,58 @@ patients are your result, and correcting them deletes it.
 
 If patient and batch are perfectly confounded (each patient its own run), nothing separates them
 and the offset removes both.
+
+### Alternative: correct upstream with SCTransform's `batch_var`
+
+`B` is not the only place to put the correction. `sctransform::vst` takes a `batch_var`, and its
+documentation states the mechanism precisely:
+
+> **no batch interaction terms used if omitted**
+
+**Interaction terms are the point.** With `batch_var`, batch is crossed with `latent_var`
+(default `log_umi`), so every batch gets **its own depth slope** — not merely its own intercept.
+`B` is intercept-only: one additive vector per sample, no depth term at all.
+
+That gap is not hypothetical on shallow data. On BCK_44 (766-median library) an archetype tracked
+library size at −0.300 on the analytic route. If samples differ in chemistry, depth, or
+saturation, the depth–expression *relationship* differs between them, and `B` cannot represent
+that however well it is fit.
+
+`batch_var` also fixes comparability: one global `theta` regularization across all cells, so
+residuals mean the same thing in every sample. Per-sample SCTransform gives exactly that up —
+and note that **the existing per-sample `.h5ad` files already half-correct by construction**,
+since each file's residuals are centred against its own NB fit. Concatenating those and then
+enabling `B` leaves `B` with very little to absorb.
+
+| | CyEmbed `use_sample_offset` | SCTransform `batch_var` | Seurat `vars.to.regress` |
+|---|---|---|---|
+| where | decoder intercept, residual space | inside the NB GLM, count space | post-hoc on residuals |
+| batch × depth interaction | **no** | **yes** | no |
+| reversible / A-B testable | **yes** (config flag) | no (baked into the matrix) | no |
+| cross-sample `theta` comparability | n/a | **yes** | yes |
+
+**Choosing.** They are near-redundant — pick one, do not stack them, or you double-correct and
+cannot attribute the result.
+
+- Samples differ in protocol, chemistry, or depth profile → **`batch_var`**, and you then do not
+  need `B`.
+- Same protocol, additive shifts only → **`B`**, which is cheaper and lets you measure whether
+  the correction changed anything.
+- Prefer `batch_var` over `vars.to.regress` in either case: the latter regresses on residuals
+  post-hoc, while `batch_var` models the effect at the count level where it lives.
+
+**Neither solves the composition problem.** Both absorb per-sample per-gene means, and a
+patient's mean residual is roughly `α_patient · Z Eᵀ` — their archetype composition. So both will
+eat between-patient composition differences and push `W` toward within-patient-centred. If
+"does patient A use program 3 more than patient B" is your endpoint, that is the signal being
+removed. This is structural reasoning, not a measurement, and note that
+`tools/verify_sample_offset.py` **does not test it**: it plants a technical shift independent of
+composition, so `w_recovery → 0.99` establishes only that `B` preserves biology when the shift is
+*not* confounded with composition — which is not the usual case in a patient cohort.
+
+**Caution on `batch_var`:** its documentation is a single line and it is far less exercised than
+the rest of `sctransform`. Validate it on your data rather than trusting it — the depth-vs-usage
+correlation in §8 is the direct test, and it already caught one artifact.
 
 ---
 

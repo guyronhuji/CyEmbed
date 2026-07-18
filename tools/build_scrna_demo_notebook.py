@@ -293,16 +293,24 @@ more consequentially here, on how hard the result is clipped.
 |---|---|---|
 | source | raw counts, computed in this notebook | Seurat `SCT` `scale.data`, computed upstream |
 | `theta` | **fixed at 100** for every gene | per-gene, regularised NB regression |
-| clip | `sqrt(N)` = **±18.8** | Seurat default ≈ **±3.3** |
+| clip | `sqrt(N)` = **±18.8** | **±3.76 as delivered** — see below |
 | observed range | [−9.4, 18.8] | [−2.18, 3.76] |
 | observed std | **1.71** | **0.986** |
 | matrix | 352 × 2000 | 330 × 1000 |
 | cells | all passing mito/ribo QC | tumour-only (Seurat, upstream) |
 
 **The clip difference is not cosmetic, and it may matter more than `theta`.** CyEmbed's loss is
-MSE, so large residuals dominate the gradient. Clipping at ±3.3 instead of ±18.8 changes which
+MSE, so large residuals dominate the gradient. Clipping at ±3.76 instead of ±18.8 changes which
 genes get to define archetypes. When these two routes disagree, suspect the clip before the
 `theta` estimator.
+
+**But the clip is an entry-point choice, not an intrinsic property of SCTransform.**
+`sctransform::vst` (v0.4.2) defaults to `res_clip_range = c(-sqrt(ncol(umi)), sqrt(ncol(umi)))`
+— `sqrt(N)`, the *same* convention used on the analytic route. It is Seurat's `SCTransform`
+wrapper that tightens this to `sqrt(N/30)`. So calling `vst` directly would largely erase the
+clip difference in this table, leaving `theta` as the real distinction. The ±3.76 here is
+consistent with SCTransform having run on ~424 cells (`sqrt(424/30) = 3.76`) before the
+tumour-only subset to 330.
 
 Reference: Hafemeister & Satija 2019 for SCTransform, Lause/Berens/Kobak 2021 for the analytic
 form (which argues the closed form matches or beats regularised NB regression at a fraction of
@@ -390,7 +398,8 @@ if INPUT_ROUTE == "counts":
           f"(clipped at +/-{np.sqrt(counts.shape[0]):.2f})")
 else:
     print(f"residual range     : [{resid.min():.2f}, {resid.max():.2f}]  "
-          f"(clipped upstream by Seurat, roughly +/-sqrt(N/30))")
+          f"(clipped upstream; Seurat's SCTransform wrapper uses sqrt(N/30), "
+          f"sctransform::vst itself uses sqrt(N))")
 print()
 print("Top 15 genes by residual variance:")
 for r, i in enumerate(order[:15], start=1):
